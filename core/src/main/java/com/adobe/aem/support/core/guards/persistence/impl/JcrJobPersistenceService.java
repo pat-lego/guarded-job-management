@@ -377,11 +377,16 @@ public class JcrJobPersistenceService implements JobPersistenceService {
     }
 
     private void ensureStoragePathExists() {
+        // The storage path is created by repoinit, just verify it exists
         try (ResourceResolver resolver = getServiceResolver()) {
-            ensurePathExists(resolver, STORAGE_PATH);
-            resolver.commit();
+            Resource storagePath = resolver.getResource(STORAGE_PATH);
+            if (storagePath == null) {
+                LOG.warn("Storage path {} does not exist. Ensure repoinit has run.", STORAGE_PATH);
+            } else {
+                LOG.debug("Storage path {} exists and is accessible", STORAGE_PATH);
+            }
         } catch (Exception e) {
-            LOG.warn("Failed to create storage path: {}. Jobs may fail to persist.", STORAGE_PATH, e);
+            LOG.warn("Failed to verify storage path: {}. Jobs may fail to persist.", STORAGE_PATH, e);
         }
     }
 
@@ -390,9 +395,22 @@ public class JcrJobPersistenceService implements JobPersistenceService {
             return;
         }
 
-        // Create path recursively
-        String[] segments = path.split("/");
-        StringBuilder currentPath = new StringBuilder();
+        // Only create paths under the storage path (where we have permissions)
+        // The storage path itself should be created by repoinit
+        if (!path.startsWith(STORAGE_PATH)) {
+            LOG.warn("Cannot create path outside storage path: {}", path);
+            return;
+        }
+
+        // Get the subpath after the storage path
+        String subPath = path.substring(STORAGE_PATH.length());
+        if (subPath.isEmpty()) {
+            return; // Nothing to create
+        }
+
+        // Create path recursively starting from STORAGE_PATH
+        String[] segments = subPath.split("/");
+        StringBuilder currentPath = new StringBuilder(STORAGE_PATH);
         
         for (String segment : segments) {
             if (segment.isEmpty()) {
@@ -403,11 +421,15 @@ public class JcrJobPersistenceService implements JobPersistenceService {
             currentPath.append("/").append(segment);
             
             if (resolver.getResource(currentPath.toString()) == null) {
-                Resource parent = resolver.getResource(parentPath.isEmpty() ? "/" : parentPath);
+                Resource parent = resolver.getResource(parentPath);
                 if (parent != null) {
                     Map<String, Object> props = new HashMap<>();
                     props.put(ResourceResolver.PROPERTY_RESOURCE_TYPE, NT_UNSTRUCTURED);
                     resolver.create(parent, segment, props);
+                    LOG.debug("Created path: {}", currentPath);
+                } else {
+                    LOG.warn("Parent path not accessible: {}", parentPath);
+                    return;
                 }
             }
         }

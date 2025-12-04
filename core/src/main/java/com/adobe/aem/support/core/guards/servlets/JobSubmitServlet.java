@@ -92,6 +92,8 @@ public class JobSubmitServlet extends SlingAllMethodsServlet {
     protected void doPost(SlingHttpServletRequest request, SlingHttpServletResponse response)
             throws ServletException, IOException {
         
+        LOG.debug("JobSubmitServlet.doPost() called for path: {}", request.getPathInfo());
+        
         response.setContentType("application/json");
         response.setCharacterEncoding("UTF-8");
         PrintWriter writer = response.getWriter();
@@ -99,6 +101,7 @@ public class JobSubmitServlet extends SlingAllMethodsServlet {
         try {
             // Parse request body
             String body = request.getReader().lines().collect(Collectors.joining());
+            LOG.debug("Request body: {}", body);
             JsonObject json = JsonParser.parseString(body).getAsJsonObject();
 
             // Extract required fields
@@ -124,7 +127,10 @@ public class JobSubmitServlet extends SlingAllMethodsServlet {
 
             // Generate token and submit the job
             String token = tokenService.generateToken();
+            LOG.debug("Generated token: {}", token);
+            LOG.debug("Submitting job: topic={}, jobName={}, job={}", topic, jobName, job.getClass().getName());
             submitJob(topic, token, job, parameters);
+            LOG.debug("Job submitted successfully");
 
             // Return success response
             JsonObject result = new JsonObject();
@@ -137,9 +143,10 @@ public class JobSubmitServlet extends SlingAllMethodsServlet {
             writer.write(GSON.toJson(result));
 
         } catch (IllegalArgumentException e) {
+            LOG.warn("IllegalArgumentException in job submission: {}", e.getMessage(), e);
             sendError(response, writer, 400, e.getMessage());
         } catch (Exception e) {
-            LOG.error("Error submitting job", e);
+            LOG.error("Error submitting job: {}", e.getMessage(), e);
             sendError(response, writer, 500, "Internal error: " + e.getMessage());
         }
     }
