@@ -297,8 +297,9 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void persist_handlesEmptyParameters() throws Exception {
-        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", "admin", Map.of());
-
+        // Persist a job with empty parameters
+        persistenceService.persist("topic", "12345.sig", "job", "admin", Map.of());
+        
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
 

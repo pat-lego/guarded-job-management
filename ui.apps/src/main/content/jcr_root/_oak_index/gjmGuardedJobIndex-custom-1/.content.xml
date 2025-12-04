@@ -8,6 +8,7 @@
     - Filtering by path under /var/guarded-jobs
     
     See: https://jackrabbit.apache.org/oak/docs/query/lucene.html
+    See: https://experienceleague.adobe.com/en/docs/experience-manager-cloud-service/content/operations/indexing
 -->
 <jcr:root xmlns:jcr="http://www.jcp.org/jcr/1.0" 
           xmlns:nt="http://www.jcp.org/jcr/nt/1.0"
@@ -15,7 +16,7 @@
           xmlns:gjm="http://guarded-job-management.aem.adobe.com/1.0"
     jcr:primaryType="oak:QueryIndexDefinition"
     type="lucene"
-    async="async"
+    async="[async,nrt]"
     compatVersion="{Long}2"
     evaluatePathRestrictions="{Boolean}true"
     includedPaths="[/var/guarded-jobs]"
@@ -42,4 +43,7 @@
             </properties>
         </gjm:GuardedJob>
     </indexRules>
+    <tika jcr:primaryType="nt:folder">
+        <config.xml jcr:primaryType="nt:file"/>
+    </tika>
 </jcr:root>
