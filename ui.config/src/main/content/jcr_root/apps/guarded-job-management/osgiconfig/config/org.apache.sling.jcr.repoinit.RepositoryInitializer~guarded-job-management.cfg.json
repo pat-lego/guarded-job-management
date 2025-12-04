@@ -1,0 +1,6 @@
+{
+    "scripts": [
+        "# Create the service user for job persistence\ncreate service user guarded-job-service with path system/guarded-job-management\n\n# Create the storage path for persisted jobs\ncreate path (sling:Folder) /var/guarded-jobs\n\n# Grant the service user full access to the storage path\nset ACL for guarded-job-service\n    allow jcr:all on /var/guarded-jobs\nend"
+    ]
+}
+

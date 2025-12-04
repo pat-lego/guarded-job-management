@@ -1,0 +1,6 @@
+{
+    "user.mapping": [
+        "guarded-job-management.core:guarded-job-service=[guarded-job-service]"
+    ]
+}
+

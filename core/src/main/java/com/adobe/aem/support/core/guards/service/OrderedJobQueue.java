@@ -33,12 +33,28 @@ public class OrderedJobQueue {
      * @throws IllegalArgumentException if token is invalid
      */
     public synchronized <T> CompletableFuture<T> add(String token, GuardedJob<T> job, Map<String, Object> parameters) {
+        return add(token, job, parameters, null);
+    }
+
+    /**
+     * Adds a job to the queue with an optional persistence ID.
+     *
+     * @param token         the guarded order token
+     * @param job           the job to execute
+     * @param parameters    the parameters to pass to the job
+     * @param persistenceId optional ID for tracking persisted jobs (null if not persisted)
+     * @param <T>           the job result type
+     * @return a future that will contain the job result
+     * @throws IllegalArgumentException if token is invalid
+     */
+    public synchronized <T> CompletableFuture<T> add(String token, GuardedJob<T> job, 
+            Map<String, Object> parameters, String persistenceId) {
         if (!tokenService.isValid(token)) {
             throw new IllegalArgumentException("Invalid or tampered token");
         }
         long timestamp = tokenService.extractTimestamp(token);
         CompletableFuture<T> future = new CompletableFuture<>();
-        jobs.put(timestamp, new JobEntry<>(job, parameters, future));
+        jobs.put(timestamp, new JobEntry<>(job, parameters, future, persistenceId));
         return future;
     }
 
@@ -73,11 +89,17 @@ public class OrderedJobQueue {
         private final GuardedJob<T> job;
         private final Map<String, Object> parameters;
         private final CompletableFuture<T> future;
+        private final String persistenceId;
 
         JobEntry(GuardedJob<T> job, Map<String, Object> parameters, CompletableFuture<T> future) {
+            this(job, parameters, future, null);
+        }
+
+        JobEntry(GuardedJob<T> job, Map<String, Object> parameters, CompletableFuture<T> future, String persistenceId) {
             this.job = job;
             this.parameters = parameters;
             this.future = future;
+            this.persistenceId = persistenceId;
         }
 
         public GuardedJob<T> getJob() {
@@ -90,6 +112,13 @@ public class OrderedJobQueue {
 
         public CompletableFuture<T> getFuture() {
             return future;
+        }
+
+        /**
+         * Returns the persistence ID if this job was persisted, null otherwise.
+         */
+        public String getPersistenceId() {
+            return persistenceId;
         }
 
         /**

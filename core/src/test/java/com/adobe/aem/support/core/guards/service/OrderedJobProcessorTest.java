@@ -30,15 +30,17 @@ class OrderedJobProcessorTest {
         tokenServiceField.setAccessible(true);
         tokenServiceField.set(processor, tokenService);
         
+        // Find the Config interface by name
+        Class<?> configClass = findConfigClass();
+        
         // Simulate OSGi activation with config
-        java.lang.reflect.Method activateMethod = OrderedJobProcessor.class.getDeclaredMethod("activate", 
-            OrderedJobProcessor.class.getDeclaredClasses()[0]);
+        java.lang.reflect.Method activateMethod = OrderedJobProcessor.class.getDeclaredMethod("activate", configClass);
         activateMethod.setAccessible(true);
         
         // Create a proxy for the Config interface
         Object configProxy = java.lang.reflect.Proxy.newProxyInstance(
             OrderedJobProcessor.class.getClassLoader(),
-            new Class<?>[] { OrderedJobProcessor.class.getDeclaredClasses()[0] },
+            new Class<?>[] { configClass },
             (proxy, method, args) -> {
                 if ("coalesceTimeMs".equals(method.getName())) {
                     return 10L; // 10ms coalesce time for tests
@@ -50,6 +52,15 @@ class OrderedJobProcessorTest {
             }
         );
         activateMethod.invoke(processor, configProxy);
+    }
+
+    private Class<?> findConfigClass() {
+        for (Class<?> clazz : OrderedJobProcessor.class.getDeclaredClasses()) {
+            if (clazz.getSimpleName().equals("Config")) {
+                return clazz;
+            }
+        }
+        throw new IllegalStateException("Config class not found in OrderedJobProcessor");
     }
 
     @AfterEach
@@ -306,13 +317,13 @@ class OrderedJobProcessorTest {
         tokenServiceField.setAccessible(true);
         tokenServiceField.set(shortTimeoutProcessor, tokenService);
         
-        java.lang.reflect.Method activateMethod = OrderedJobProcessor.class.getDeclaredMethod("activate", 
-            OrderedJobProcessor.class.getDeclaredClasses()[0]);
+        Class<?> configClass = findConfigClass();
+        java.lang.reflect.Method activateMethod = OrderedJobProcessor.class.getDeclaredMethod("activate", configClass);
         activateMethod.setAccessible(true);
         
         Object configProxy = java.lang.reflect.Proxy.newProxyInstance(
             OrderedJobProcessor.class.getClassLoader(),
-            new Class<?>[] { OrderedJobProcessor.class.getDeclaredClasses()[0] },
+            new Class<?>[] { configClass },
             (proxy, method, args) -> {
                 if ("coalesceTimeMs".equals(method.getName())) {
                     return 10L;

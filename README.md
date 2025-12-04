@@ -314,6 +314,88 @@ WARN  Job 'slow-task' in topic 'my-topic' cancelled after 30 seconds (timeout: 3
       This may indicate a long-running or stuck job that could cause queue bottlenecking and high heap usage.
 ```
 
+### JcrJobPersistenceService (Optional)
+
+Enable job persistence for durability across JVM restarts:
+
+**OSGi Config:** `com.adobe.aem.support.core.guards.persistence.impl.JcrJobPersistenceService.cfg.json`
+
+```json
+{
+    "enabled": false
+}
+```
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `enabled` | false | Enable job persistence (disabled by default) |
+
+> **Note:** Jobs are always stored at `/var/guarded-jobs` using the `guarded-job-service` service user. These are not configurable to ensure consistent behavior.
+
+#### How Persistence Works
+
+When enabled, jobs are passivated to the JCR repository:
+
+```
+Job Submitted ──▶ Persisted to JCR ──▶ Processing ──▶ Removed from JCR
+                        │
+                        │ (JVM crashes/restarts)
+                        ▼
+                  On Startup: Load persisted jobs ──▶ Resubmit for processing
+```
+
+**Storage structure:**
+```
+/var/guarded-jobs/
+  my-topic/
+    550e8400-e29b-41d4-a716-446655440000/
+      - token: "1733325600001.kX9mQz..."
+      - jobName: "echo"
+      - persistedAt: 1733325600000
+      - parameters: (binary JSON blob)
+```
+
+**When to enable persistence:**
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Development/testing | Disabled (default) |
+| Non-critical jobs | Disabled |
+| Critical business operations | **Enabled** |
+| Jobs that must not be lost | **Enabled** |
+
+#### Automatic Setup via Repo Init
+
+The service user and permissions are automatically configured via Sling Repository Initializer:
+
+**Repo Init Script:** `org.apache.sling.jcr.repoinit.RepositoryInitializer~guarded-job-management.cfg.json`
+
+```
+# Create the service user for job persistence
+create service user guarded-job-service with path system/guarded-job-management
+
+# Create the storage path for persisted jobs
+create path (sling:Folder) /var/guarded-jobs
+
+# Grant the service user full access to the storage path
+set ACL for guarded-job-service
+    allow jcr:all on /var/guarded-jobs
+end
+```
+
+**Service User Mapping:**
+
+`org.apache.sling.serviceusermapping.impl.ServiceUserMapperImpl.amended-guarded-job-management.cfg.json`
+```json
+{
+    "user.mapping": [
+        "guarded-job-management.core:guarded-job-service=[guarded-job-service]"
+    ]
+}
+```
+
+No manual setup required — just deploy the package and enable persistence!
+
 ## 🧪 Testing with Scripts
 
 A Node.js script is included for testing:
@@ -377,6 +459,10 @@ guarded-job-management/
 │       │   ├── OrderedJobQueue.java             # Ordered queue
 │       │   └── impl/
 │       │       └── OrderedJobProcessor.java     # Main processor
+│       ├── persistence/
+│       │   ├── JobPersistenceService.java       # Persistence interface
+│       │   └── impl/
+│       │       └── JcrJobPersistenceService.java # JCR implementation
 │       ├── servlets/
 │       │   ├── JobSubmitServlet.java            # POST .submit
 │       │   ├── JobStatusServlet.java            # GET .status
@@ -386,7 +472,11 @@ guarded-job-management/
 │           └── EmptyGuardedJob.java             # Minimal example
 ├── ui.config/
 │   └── src/main/content/jcr_root/apps/.../osgiconfig/
-│       └── com.adobe.aem.support.core.guards.token.impl.GuardedOrderTokenServiceImpl.cfg.json
+│       ├── com.adobe.aem.support.core.guards.token.impl.GuardedOrderTokenServiceImpl.cfg.json
+│       ├── com.adobe.aem.support.core.guards.service.impl.OrderedJobProcessor.cfg.json
+│       ├── com.adobe.aem.support.core.guards.persistence.impl.JcrJobPersistenceService.cfg.json
+│       ├── org.apache.sling.serviceusermapping.impl.ServiceUserMapperImpl.amended-guarded-job-management.cfg.json
+│       └── org.apache.sling.jcr.repoinit.RepositoryInitializer~guarded-job-management.cfg.json
 ├── scripts/
 │   ├── submit-jobs.mjs                          # Test script
 │   └── package.json
