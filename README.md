@@ -1,5 +1,7 @@
 # Guarded Job Management for AEM
 
+[![Build](https://github.com/pat-lego/guarded-job-management/actions/workflows/build.yml/badge.svg)](https://github.com/pat-lego/guarded-job-management/actions/workflows/build.yml)
+[![codecov](https://codecov.io/gh/pat-lego/guarded-job-management/branch/master/graph/badge.svg)](https://codecov.io/gh/pat-lego/guarded-job-management)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 A distributed job processing system for Adobe Experience Manager (AEM) that guarantees **ordered execution** of jobs, even when submitted from multiple machines with network delays.
