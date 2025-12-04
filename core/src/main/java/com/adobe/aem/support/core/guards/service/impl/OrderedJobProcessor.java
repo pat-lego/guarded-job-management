@@ -359,7 +359,9 @@ public class OrderedJobProcessor implements JobProcessor {
                 
                 // For async jobs, poll until complete or timeout
                 if (jobImpl.isAsync()) {
+                    boolean firstCheck = true;
                     while (!jobImpl.isComplete(persistedJob.getParameters())) {
+                        firstCheck = false;
                         long elapsed = System.currentTimeMillis() - startTime;
                         if (elapsed >= timeoutMs) {
                             throw new RuntimeException(String.format(
@@ -371,6 +373,14 @@ public class OrderedJobProcessor implements JobProcessor {
                         if (sleepMs > 0) {
                             Thread.sleep(sleepMs);
                         }
+                    }
+                    
+                    // Warn if isComplete() returned true immediately (likely forgot to override)
+                    if (firstCheck) {
+                        LOG.warn("Async job '{}' returned isComplete()=true immediately after execute(). " +
+                                "This likely means isComplete() was not overridden. " +
+                                "The job will be marked as complete without polling for async completion.",
+                                jobName);
                     }
                 }
             } catch (InterruptedException e) {

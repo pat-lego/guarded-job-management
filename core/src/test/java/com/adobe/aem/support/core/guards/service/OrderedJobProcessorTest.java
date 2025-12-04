@@ -652,6 +652,68 @@ class OrderedJobProcessorTest {
         verify(persistenceService, timeout(5000)).remove("/var/guarded-jobs/async-global-timeout-job");
     }
 
+    @Test
+    void asyncJob_completesImmediatelyWhenIsCompleteNotOverridden() throws Exception {
+        // Create an async job that does NOT override isComplete() (uses default which returns true)
+        CountDownLatch executeCompleted = new CountDownLatch(1);
+        GuardedJob<String> asyncJobWithoutIsComplete = new GuardedJob<String>() {
+            @Override
+            public String getName() { return "async-no-isComplete-override"; }
+            
+            @Override
+            public String execute(Map<String, Object> parameters) {
+                executeCompleted.countDown();
+                return "started";
+            }
+            
+            @Override
+            public boolean isAsync() {
+                return true;
+            }
+            
+            // Note: isComplete() is NOT overridden - uses default which returns true
+            
+            @Override
+            public long getTimeoutSeconds() {
+                return 5;
+            }
+        };
+        
+        // Register via reflection
+        Field registeredJobsField = OrderedJobProcessor.class.getDeclaredField("registeredJobs");
+        registeredJobsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, GuardedJob<?>> registeredJobs = (Map<String, GuardedJob<?>>) registeredJobsField.get(processor);
+        registeredJobs.put("async-no-isComplete-override", asyncJobWithoutIsComplete);
+        
+        // Set up persisted job
+        String token = tokenService.generateToken();
+        PersistedJob persistedJob = new PersistedJob(
+            "/var/guarded-jobs/async-no-override-job",
+            "topic",
+            token,
+            "async-no-isComplete-override",
+            Map.of(),
+            System.currentTimeMillis()
+        );
+        
+        when(persistenceService.loadAll())
+            .thenReturn(List.of(persistedJob))
+            .thenReturn(List.of());
+        
+        // Manually trigger poll
+        java.lang.reflect.Method pollMethod = OrderedJobProcessor.class.getDeclaredMethod("pollAndProcessJobs");
+        pollMethod.setAccessible(true);
+        pollMethod.invoke(processor);
+        
+        // Wait for execute to complete
+        assertTrue(executeCompleted.await(2, TimeUnit.SECONDS), "Job execute() should have been called");
+        
+        // Job should still complete and be removed from JCR (even though isComplete wasn't overridden)
+        // The warning log will be emitted but the job should still succeed
+        verify(persistenceService, timeout(5000)).remove("/var/guarded-jobs/async-no-override-job");
+    }
+
     // === Helper Methods ===
 
     private GuardedJob<String> testJob(String name) {
