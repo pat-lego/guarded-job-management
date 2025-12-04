@@ -340,4 +340,65 @@ class JcrJobPersistenceServiceTest {
         assertEquals(1, jobs.size());
         assertEquals("1234567890.abcdef123", jobs.get(0).getToken());
     }
+
+    // === Error path tests ===
+
+    @Test
+    void persist_throwsOnInvalidTokenFormat() {
+        // Token without a dot separator should fail
+        assertThrows(JobPersistenceService.JobPersistenceException.class,
+            () -> persistenceService.persist("topic", "invalid-token-no-dot", "job", Map.of()));
+    }
+
+    @Test
+    void persist_throwsOnNonNumericTimestamp() {
+        // Token with non-numeric timestamp should fail
+        assertThrows(JobPersistenceService.JobPersistenceException.class,
+            () -> persistenceService.persist("topic", "not-a-number.signature", "job", Map.of()));
+    }
+
+    // === PersistedJob tests ===
+
+    @Test
+    void persistedJob_gettersReturnCorrectValues() throws Exception {
+        String topic = "test-topic";
+        String token = "999888777.test-sig";
+        String jobName = "test-job";
+        Map<String, Object> params = Map.of("key", "value");
+
+        persistenceService.persist(topic, token, jobName, params);
+
+        when(clusterLeaderService.isLeader()).thenReturn(true);
+        List<PersistedJob> jobs = persistenceService.loadAll();
+
+        assertEquals(1, jobs.size());
+        PersistedJob job = jobs.get(0);
+
+        assertEquals(topic, job.getTopic());
+        assertEquals(token, job.getToken());
+        assertEquals(jobName, job.getJobName());
+        assertEquals("value", job.getParameters().get("key"));
+        assertNotNull(job.getPersistenceId());
+        assertTrue(job.getPersistedAt() > 0);
+    }
+
+    @Test
+    void persistedJob_constructorInitializesAllFields() {
+        Map<String, Object> params = Map.of("a", "b");
+        PersistedJob job = new PersistedJob(
+            "/var/test/path",
+            "my-topic",
+            "12345.sig",
+            "my-job",
+            params,
+            1234567890L
+        );
+
+        assertEquals("/var/test/path", job.getPersistenceId());
+        assertEquals("my-topic", job.getTopic());
+        assertEquals("12345.sig", job.getToken());
+        assertEquals("my-job", job.getJobName());
+        assertEquals(params, job.getParameters());
+        assertEquals(1234567890L, job.getPersistedAt());
+    }
 }

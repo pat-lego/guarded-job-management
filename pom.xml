@@ -237,6 +237,21 @@
           <groupId>org.jacoco</groupId>
           <artifactId>jacoco-maven-plugin</artifactId>
           <version>0.8.11</version>
+          <configuration>
+            <excludes>
+              <!-- Package info files -->
+              <exclude>**/package-info.class</exclude>
+              <!-- Servlets - require full HTTP context, tested via integration tests -->
+              <exclude>**/servlets/**</exclude>
+              <!-- Cluster leader service - depends on Sling Discovery API -->
+              <exclude>**/cluster/impl/**</exclude>
+              <!-- OSGi service wrapper - thin wrapper around GuardedOrderToken -->
+              <exclude>**/token/impl/**</exclude>
+              <!-- Simple example jobs -->
+              <exclude>**/jobs/EchoJob.class</exclude>
+              <exclude>**/jobs/EmptyGuardedJob.class</exclude>
+            </excludes>
+          </configuration>
           <executions>
             <execution>
               <id>prepare-agent</id>

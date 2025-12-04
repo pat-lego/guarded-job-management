@@ -16,6 +16,7 @@ import org.mockito.quality.Strictness;
 
 import javax.jcr.Session;
 import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.doThrow;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -431,6 +433,78 @@ class ReplicationGuardedJobTest {
         assertTrue(str.contains("requestId="));
         assertTrue(str.contains("state='COMPLETED'"));
         assertTrue(str.contains("/content/test"));
+    }
+
+    // === Error Handling Tests ===
+
+    @Test
+    void execute_throwsRuntimeExceptionOnReplicationFailure() throws Exception {
+        com.day.cq.replication.ReplicationException replicationException = 
+            new com.day.cq.replication.ReplicationException("Connection refused");
+        
+        doThrow(replicationException)
+            .when(replicator).replicate(any(Session.class), any(ReplicationActionType.class), 
+                any(String[].class), any(ReplicationOptions.class));
+
+        Map<String, Object> parameters = new HashMap<>();
+        parameters.put(JobSubmitServlet.PARAM_RESOURCE_RESOLVER, resourceResolver);
+        parameters.put("paths", new String[]{"/content/test"});
+
+        RuntimeException ex = assertThrows(RuntimeException.class, () -> job.execute(parameters));
+        assertTrue(ex.getMessage().contains("Replication failed"));
+        assertTrue(ex.getCause() instanceof com.day.cq.replication.ReplicationException);
+    }
+
+    // === ArrayList Path Type Test ===
+
+    @Test
+    void execute_parsesArrayListPaths() throws Exception {
+        ArrayList<String> paths = new ArrayList<>();
+        paths.add("/content/a");
+        paths.add("/content/b");
+        
+        Map<String, Object> parameters = new HashMap<>();
+        parameters.put(JobSubmitServlet.PARAM_RESOURCE_RESOLVER, resourceResolver);
+        parameters.put("paths", paths);
+
+        job.execute(parameters);
+
+        ArgumentCaptor<String[]> pathsCaptor = ArgumentCaptor.forClass(String[].class);
+        verify(replicator).replicate(eq(session), eq(ReplicationActionType.ACTIVATE), 
+            pathsCaptor.capture(), any(ReplicationOptions.class));
+        
+        assertArrayEquals(new String[]{"/content/a", "/content/b"}, pathsCaptor.getValue());
+    }
+
+    @Test
+    void execute_throwsForInvalidPathType() {
+        Map<String, Object> parameters = new HashMap<>();
+        parameters.put(JobSubmitServlet.PARAM_RESOURCE_RESOLVER, resourceResolver);
+        parameters.put("paths", 12345); // Invalid type
+
+        assertThrows(IllegalArgumentException.class, () -> job.execute(parameters));
+    }
+
+    // === GuardedJob Interface Default Methods ===
+
+    @Test
+    void isAsync_returnsFalseByDefault() {
+        assertFalse(job.isAsync());
+    }
+
+    @Test
+    void isComplete_returnsTrueByDefault() throws Exception {
+        assertTrue(job.isComplete(new HashMap<>()));
+    }
+
+    @Test
+    void getAsyncPollingIntervalMs_returnsDefault() {
+        assertEquals(1000, job.getAsyncPollingIntervalMs());
+    }
+
+    @Test
+    void getTimeoutSeconds_returnsNegativeOneByDefault() {
+        assertEquals(-1, job.getTimeoutSeconds());
     }
 }
 

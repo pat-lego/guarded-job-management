@@ -157,5 +157,96 @@ class GuardedOrderTokenTest {
         assertNotEquals(token1, token2);
         assertNotEquals(0, tokenGenerator.compare(token1, token2));
     }
+
+    // === equals/hashCode tests ===
+
+    @Test
+    void equals_returnsTrueForSameSecretKey() {
+        GuardedOrderToken token1 = new GuardedOrderToken("same-key");
+        GuardedOrderToken token2 = new GuardedOrderToken("same-key");
+        assertEquals(token1, token2);
+        assertEquals(token1.hashCode(), token2.hashCode());
+    }
+
+    @Test
+    void equals_returnsFalseForDifferentSecretKey() {
+        GuardedOrderToken token1 = new GuardedOrderToken("key-1");
+        GuardedOrderToken token2 = new GuardedOrderToken("key-2");
+        assertNotEquals(token1, token2);
+    }
+
+    @Test
+    void equals_returnsFalseForNull() {
+        GuardedOrderToken token = new GuardedOrderToken("key");
+        assertNotEquals(null, token);
+    }
+
+    @Test
+    void equals_returnsFalseForDifferentType() {
+        GuardedOrderToken token = new GuardedOrderToken("key");
+        assertNotEquals("not a token", token);
+    }
+
+    @Test
+    void equals_returnsTrueForSameInstance() {
+        GuardedOrderToken token = new GuardedOrderToken("key");
+        assertEquals(token, token);
+    }
+
+    @Test
+    void constructor_acceptsByteArrayKey() {
+        byte[] keyBytes = "my-secret-key".getBytes();
+        GuardedOrderToken token = new GuardedOrderToken(keyBytes);
+        
+        String generated = token.generate();
+        assertNotNull(generated);
+        assertTrue(token.isValid(generated));
+    }
+
+    // === compare error paths ===
+
+    @Test
+    void compare_throwsForInvalidToken1() {
+        String validToken = tokenGenerator.generate();
+        
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> tokenGenerator.compare("invalid.tampered", validToken));
+        assertTrue(ex.getMessage().contains("Token 1"));
+    }
+
+    @Test
+    void compare_throwsForInvalidToken2() {
+        String validToken = tokenGenerator.generate();
+        
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            () -> tokenGenerator.compare(validToken, "invalid.tampered"));
+        assertTrue(ex.getMessage().contains("Token 2"));
+    }
+
+    @Test
+    void compare_returnsZeroForIdenticalTokens() {
+        String token = tokenGenerator.generate();
+        assertEquals(0, tokenGenerator.compare(token, token));
+    }
+
+    // === extractTimestamp edge cases ===
+
+    @Test
+    void extractTimestamp_throwsForNullToken() {
+        assertThrows(IllegalArgumentException.class,
+            () -> tokenGenerator.extractTimestamp(null));
+    }
+
+    @Test
+    void extractTimestamp_throwsForEmptyToken() {
+        assertThrows(IllegalArgumentException.class,
+            () -> tokenGenerator.extractTimestamp(""));
+    }
+
+    @Test
+    void extractTimestamp_throwsForMalformedToken() {
+        assertThrows(IllegalArgumentException.class,
+            () -> tokenGenerator.extractTimestamp("no-delimiter"));
+    }
 }
 

@@ -714,6 +714,66 @@ class OrderedJobProcessorTest {
         verify(persistenceService, timeout(5000)).remove("/var/guarded-jobs/async-no-override-job");
     }
 
+    // === OSGi Lifecycle Tests ===
+
+    @Test
+    void bindGuardedJob_registersJob() throws Exception {
+        GuardedJob<String> job = testJob("dynamic-job");
+        
+        // Use the bind method via reflection
+        java.lang.reflect.Method bindMethod = OrderedJobProcessor.class.getDeclaredMethod("bindGuardedJob", GuardedJob.class);
+        bindMethod.setAccessible(true);
+        bindMethod.invoke(processor, job);
+        
+        // Verify job is registered
+        Field registeredJobsField = OrderedJobProcessor.class.getDeclaredField("registeredJobs");
+        registeredJobsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, GuardedJob<?>> registeredJobs = (Map<String, GuardedJob<?>>) registeredJobsField.get(processor);
+        
+        assertTrue(registeredJobs.containsKey("dynamic-job"));
+        assertEquals(job, registeredJobs.get("dynamic-job"));
+    }
+
+    @Test
+    void unbindGuardedJob_unregistersJob() throws Exception {
+        GuardedJob<String> job = testJob("removable-job");
+        
+        // First bind the job
+        java.lang.reflect.Method bindMethod = OrderedJobProcessor.class.getDeclaredMethod("bindGuardedJob", GuardedJob.class);
+        bindMethod.setAccessible(true);
+        bindMethod.invoke(processor, job);
+        
+        // Verify it's registered
+        Field registeredJobsField = OrderedJobProcessor.class.getDeclaredField("registeredJobs");
+        registeredJobsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, GuardedJob<?>> registeredJobs = (Map<String, GuardedJob<?>>) registeredJobsField.get(processor);
+        assertTrue(registeredJobs.containsKey("removable-job"));
+        
+        // Now unbind
+        java.lang.reflect.Method unbindMethod = OrderedJobProcessor.class.getDeclaredMethod("unbindGuardedJob", GuardedJob.class);
+        unbindMethod.setAccessible(true);
+        unbindMethod.invoke(processor, job);
+        
+        // Verify it's unregistered
+        assertFalse(registeredJobs.containsKey("removable-job"));
+    }
+
+    @Test
+    void deactivate_shutsDownProcessor() throws Exception {
+        // Get deactivate method
+        java.lang.reflect.Method deactivateMethod = OrderedJobProcessor.class.getDeclaredMethod("deactivate");
+        deactivateMethod.setAccessible(true);
+        
+        assertFalse(processor.isShutdown());
+        
+        deactivateMethod.invoke(processor);
+        
+        assertTrue(processor.isShutdown());
+    }
+
+
     // === Helper Methods ===
 
     private GuardedJob<String> testJob(String name) {
