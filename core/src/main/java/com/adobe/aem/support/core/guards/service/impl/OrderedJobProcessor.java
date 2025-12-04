@@ -315,9 +315,11 @@ public class OrderedJobProcessor implements JobProcessor {
     private void executeJob(PersistedJob persistedJob, GuardedJob<?> jobImpl) {
         String jobName = persistedJob.getJobName();
         String topic = persistedJob.getTopic();
+        String token = persistedJob.getToken();
 
-        LOG.debug("Executing job: topic={}, name={}, id={}",
-                topic, jobName, persistedJob.getPersistenceId());
+        // INFO level log with token for execution order verification
+        LOG.info("Executing job: topic={}, jobName={}, token={}",
+                topic, jobName, token);
 
         // Determine timeout: use job-specific timeout if set, otherwise use global default
         long jobSpecificTimeout = jobImpl.getTimeoutSeconds();

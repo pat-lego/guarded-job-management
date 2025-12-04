@@ -478,12 +478,28 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         return resolverFactory.getServiceResourceResolver(authInfo);
     }
 
+    /**
+     * Parameters that should not be persisted (non-serializable or request-scoped objects).
+     */
+    private static final Set<String> NON_SERIALIZABLE_PARAMS = Set.of(
+        "_resourceResolver",  // ResourceResolver cannot be serialized
+        "_request",           // SlingHttpServletRequest cannot be serialized
+        "_response"           // SlingHttpServletResponse cannot be serialized
+    );
+
     private String serializeParameters(Map<String, Object> parameters) {
         if (parameters == null) {
             return "{}";
         }
         try {
-            return OBJECT_MAPPER.writeValueAsString(parameters);
+            // Filter out non-serializable parameters
+            Map<String, Object> serializableParams = new HashMap<>();
+            for (Map.Entry<String, Object> entry : parameters.entrySet()) {
+                if (!NON_SERIALIZABLE_PARAMS.contains(entry.getKey())) {
+                    serializableParams.put(entry.getKey(), entry.getValue());
+                }
+            }
+            return OBJECT_MAPPER.writeValueAsString(serializableParams);
         } catch (JsonProcessingException e) {
             LOG.warn("Failed to serialize parameters, using empty map", e);
             return "{}";

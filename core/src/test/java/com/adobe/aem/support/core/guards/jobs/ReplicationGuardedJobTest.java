@@ -4,7 +4,9 @@ import com.adobe.aem.support.core.guards.servlets.JobSubmitServlet;
 import com.day.cq.replication.ReplicationActionType;
 import com.day.cq.replication.ReplicationOptions;
 import com.day.cq.replication.Replicator;
+import org.apache.sling.api.resource.LoginException;
 import org.apache.sling.api.resource.ResourceResolver;
+import org.apache.sling.api.resource.ResourceResolverFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -35,6 +37,9 @@ class ReplicationGuardedJobTest {
     private Replicator replicator;
 
     @Mock
+    private ResourceResolverFactory resolverFactory;
+
+    @Mock
     private ResourceResolver resourceResolver;
 
     @Mock
@@ -50,6 +55,11 @@ class ReplicationGuardedJobTest {
         Field replicatorField = ReplicationGuardedJob.class.getDeclaredField("replicator");
         replicatorField.setAccessible(true);
         replicatorField.set(job, replicator);
+
+        // Inject the resolverFactory via reflection
+        Field resolverFactoryField = ReplicationGuardedJob.class.getDeclaredField("resolverFactory");
+        resolverFactoryField.setAccessible(true);
+        resolverFactoryField.set(job, resolverFactory);
         
         // Set up ResourceResolver to return Session
         when(resourceResolver.adaptTo(Session.class)).thenReturn(session);
@@ -71,15 +81,19 @@ class ReplicationGuardedJobTest {
     // === ResourceResolver Tests ===
 
     @Test
-    void execute_failsWithoutResourceResolver() {
+    void execute_failsWithoutResourceResolver() throws Exception {
+        // When no ResourceResolver is in parameters, the job tries to use impersonation
+        // which will fail if the service resolver cannot be obtained
+        when(resolverFactory.getServiceResourceResolver(any())).thenThrow(new LoginException("Service user not found"));
+
         Map<String, Object> parameters = new HashMap<>();
         parameters.put("paths", new String[]{"/content/test"});
         // No ResourceResolver in parameters
 
-        IllegalStateException exception = assertThrows(IllegalStateException.class,
+        LoginException exception = assertThrows(LoginException.class,
             () -> job.execute(parameters));
         
-        assertTrue(exception.getMessage().contains("ResourceResolver not found"));
+        assertTrue(exception.getMessage().contains("Service user not found"));
     }
 
     @Test

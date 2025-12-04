@@ -1,6 +1,6 @@
 {
     "scripts": [
         "# Register the GuardedJob mixin node type for indexing\nregister nodetypes\n<<===\n<gjm = 'http://guarded-job-management.aem.adobe.com/1.0'>\n\n[gjm:GuardedJob] > mix:created\n  mixin\n  - gjm:tokenTimestamp (long) mandatory\n  - gjm:tokenSignature (string)\n  - gjm:topic (string) mandatory\n  - gjm:jobName (string) mandatory\n===>>",
-        "# Create the service user for job persistence\ncreate service user guarded-job-service with path system/guarded-job-management\n\n# Create the storage path for persisted jobs\ncreate path (sling:Folder) /var/guarded-jobs\n\n# Grant the service user full access to the storage path\nset ACL for guarded-job-service\n    allow jcr:all on /var/guarded-jobs\nend"
+        "# Create the service user for job persistence and replication\ncreate service user guarded-job-service with path system/guarded-job-management\n\n# Create the storage path for persisted jobs\ncreate path (sling:Folder) /var/guarded-jobs\n\n# Grant the service user full access to the storage path\nset ACL for guarded-job-service\n    allow jcr:all on /var/guarded-jobs\nend\n\n# Grant impersonation privileges so the service user can replicate on behalf of submitting users\nset principal ACL for guarded-job-service\n    allow jcr:read on /content\nend"
     ]
 }

@@ -2,8 +2,15 @@
   "name": "guarded-job-scripts",
   "type": "module",
   "scripts": {
-    "submit": "node submit-jobs.mjs",
-    "list": "node -e \"fetch('http://localhost:4502/bin/guards/job.list.json',{headers:{Authorization:'Basic '+Buffer.from('admin:admin').toString('base64')}}).then(r=>r.json()).then(console.log)\""
+    "test:echo": "node submit-jobs.mjs",
+    "test:replicate": "node test-replication.mjs",
+    "test:ordered": "node test-ordered-replication.mjs",
+    "test:ordered:debug": "DEBUG=gjm:* node test-ordered-replication.mjs",
+    "list": "node -e \"import('dotenv/config');fetch(process.env.AEM_URL+'/bin/guards/job.list.json',{headers:{Authorization:'Basic '+Buffer.from(process.env.AEM_USERNAME+':'+process.env.AEM_PASSWORD).toString('base64')}}).then(r=>r.json()).then(console.log)\""
+  },
+  "dependencies": {
+    "debug": "^4.3.4",
+    "dotenv": "^16.3.1"
   }
 }
 

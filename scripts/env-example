@@ -1,0 +1,13 @@
+# AEM Connection Configuration
+# Copy this file to .env and update with your values
+
+# AEM instance URL (no trailing slash)
+AEM_URL=http://localhost:4502
+
+# AEM credentials
+AEM_USERNAME=admin
+AEM_PASSWORD=admin
+
+# Optional: Poll interval in milliseconds (default: 500)
+POLL_INTERVAL_MS=500
+

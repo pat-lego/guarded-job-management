@@ -5,15 +5,24 @@
  * 
  * Usage: node submit-jobs.mjs
  * 
+ * Configuration: Create a .env file with:
+ *   AEM_URL=http://localhost:4502
+ *   AEM_USERNAME=admin
+ *   AEM_PASSWORD=admin
+ * 
  * VS Code: Install "Code Runner" extension, then right-click -> "Run Code"
  */
 
-const BASE_URL = 'http://localhost:4502';
-const AUTH = 'admin:admin';
-const POLL_INTERVAL_MS = 500;
+import 'dotenv/config';
+
+// Read configuration from environment variables
+const BASE_URL = process.env.AEM_URL || 'http://localhost:4502';
+const AEM_USERNAME = process.env.AEM_USERNAME || 'admin';
+const AEM_PASSWORD = process.env.AEM_PASSWORD || 'admin';
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '500', 10);
 
 function getAuthHeader() {
-  return 'Basic ' + Buffer.from(AUTH).toString('base64');
+  return 'Basic ' + Buffer.from(`${AEM_USERNAME}:${AEM_PASSWORD}`).toString('base64');
 }
 
 async function submitJob(topic, jobName, parameters) {

@@ -6,7 +6,9 @@ import com.day.cq.replication.ReplicationActionType;
 import com.day.cq.replication.ReplicationException;
 import com.day.cq.replication.ReplicationOptions;
 import com.day.cq.replication.Replicator;
+import org.apache.sling.api.resource.LoginException;
 import org.apache.sling.api.resource.ResourceResolver;
+import org.apache.sling.api.resource.ResourceResolverFactory;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.Reference;
 import org.slf4j.Logger;
@@ -14,6 +16,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.jcr.Session;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -58,9 +61,13 @@ public class ReplicationGuardedJob implements GuardedJob<ReplicationGuardedJob.R
 
     private static final String PARAM_PATHS = "paths";
     private static final String PARAM_ACTION = "action";
+    private static final String SERVICE_USER = "guarded-job-service";
 
     @Reference
     private Replicator replicator;
+
+    @Reference
+    private ResourceResolverFactory resolverFactory;
 
     @Override
     public String getName() {
@@ -68,62 +75,93 @@ public class ReplicationGuardedJob implements GuardedJob<ReplicationGuardedJob.R
     }
 
     @Override
-    @SuppressWarnings("resource") // ResourceResolver is owned by the servlet/request, not us - do not close
     public ReplicationResult execute(Map<String, Object> parameters) throws Exception {
-        // Get ResourceResolver from parameters (injected by servlet)
-        ResourceResolver resolver = (ResourceResolver) parameters.get(JobSubmitServlet.PARAM_RESOURCE_RESOLVER);
-        if (resolver == null) {
-            throw new IllegalStateException(
-                "ResourceResolver not found in parameters. This job must be submitted via JobSubmitServlet " +
-                "which provides the user's ResourceResolver. The service user does not have replication permissions.");
-        }
-
-        // Parse paths
-        String[] paths = parsePaths(parameters);
-        if (paths == null || paths.length == 0) {
-            throw new IllegalArgumentException("Missing required parameter: paths");
-        }
-
-        // Parse action (default: ACTIVATE)
-        ReplicationActionType actionType = parseAction(parameters);
-
-        String requestId = generateRequestId();
-
-        LOG.info("Initiating synchronous replication: requestId={}, action={}, paths={}",
-                requestId, actionType, Arrays.toString(paths));
-
-        Session session = resolver.adaptTo(Session.class);
-        if (session == null) {
-            throw new IllegalStateException("Could not obtain JCR session from ResourceResolver");
-        }
-
-        // Configure replication options - always synchronous
-        ReplicationOptions options = new ReplicationOptions();
-        options.setSynchronous(true);
+        // Get ResourceResolver - either from parameters (direct call) or via impersonation (from JCR)
+        ResourceResolver resolver = getResourceResolver(parameters);
+        boolean ownResolver = !(parameters.get(JobSubmitServlet.PARAM_RESOURCE_RESOLVER) instanceof ResourceResolver);
 
         try {
-            // Replicate in batches of up to 10 paths (more efficient than one-by-one, but avoids overhead of too many at once)
-            int batchSize = 10;
-            for (int i = 0; i < paths.length; i += batchSize) {
-                int end = Math.min(i + batchSize, paths.length);
-                String[] batch = Arrays.copyOfRange(paths, i, end);
-                LOG.debug("Replicating batch of {} paths: {}", batch.length, Arrays.toString(batch));
-                replicator.replicate(session, actionType, batch, options);
+            // Parse paths
+            String[] paths = parsePaths(parameters);
+            if (paths == null || paths.length == 0) {
+                throw new IllegalArgumentException("Missing required parameter: paths");
             }
 
-            LOG.info("Replication completed: requestId={}, paths={}", requestId, Arrays.toString(paths));
+            // Parse action (default: ACTIVATE)
+            ReplicationActionType actionType = parseAction(parameters);
 
-            return new ReplicationResult(
-                    requestId,
-                    "COMPLETED",
-                    paths,
-                    "Replication completed successfully"
-            );
+            String requestId = generateRequestId();
 
-        } catch (ReplicationException e) {
-            LOG.error("Replication failed: requestId={}, error={}", requestId, e.getMessage(), e);
-            throw new RuntimeException("Replication failed: " + e.getMessage(), e);
+            LOG.info("Initiating synchronous replication: requestId={}, action={}, paths={}",
+                    requestId, actionType, Arrays.toString(paths));
+
+            Session session = resolver.adaptTo(Session.class);
+            if (session == null) {
+                throw new IllegalStateException("Could not obtain JCR session from ResourceResolver");
+            }
+
+            // Configure replication options - always synchronous
+            ReplicationOptions options = new ReplicationOptions();
+            options.setSynchronous(true);
+
+            try {
+                // Replicate in batches of up to 10 paths (more efficient than one-by-one, but avoids overhead of too many at once)
+                int batchSize = 10;
+                for (int i = 0; i < paths.length; i += batchSize) {
+                    int end = Math.min(i + batchSize, paths.length);
+                    String[] batch = Arrays.copyOfRange(paths, i, end);
+                    LOG.debug("Replicating batch of {} paths: {}", batch.length, Arrays.toString(batch));
+                    replicator.replicate(session, actionType, batch, options);
+                }
+
+                LOG.info("Replication completed: requestId={}, paths={}", requestId, Arrays.toString(paths));
+
+                return new ReplicationResult(
+                        requestId,
+                        "COMPLETED",
+                        paths,
+                        "Replication completed successfully"
+                );
+
+            } catch (ReplicationException e) {
+                LOG.error("Replication failed: requestId={}, error={}", requestId, e.getMessage(), e);
+                throw new RuntimeException("Replication failed: " + e.getMessage(), e);
+            }
+        } finally {
+            // Close resolver if we created it via impersonation
+            if (ownResolver && resolver != null) {
+                resolver.close();
+            }
         }
+    }
+
+    /**
+     * Gets a ResourceResolver for replication. Tries in order:
+     * 1. Direct ResourceResolver from parameters (when called directly from servlet)
+     * 2. Impersonation using the service user and the submittedBy user ID
+     */
+    private ResourceResolver getResourceResolver(Map<String, Object> parameters) throws LoginException {
+        // First, try to get the resolver directly from parameters (when called from servlet)
+        Object resolverObj = parameters.get(JobSubmitServlet.PARAM_RESOURCE_RESOLVER);
+        if (resolverObj instanceof ResourceResolver) {
+            LOG.debug("Using ResourceResolver from parameters");
+            return (ResourceResolver) resolverObj;
+        }
+
+        // Otherwise, use impersonation with the service user
+        String submittedBy = (String) parameters.get(JobSubmitServlet.PARAM_SUBMITTED_BY);
+        if (submittedBy == null || submittedBy.isEmpty()) {
+            submittedBy = "admin"; // Fallback to admin if no user specified
+            LOG.warn("No submittedBy user found, falling back to: {}", submittedBy);
+        }
+
+        LOG.debug("Creating impersonated resolver for user: {}", submittedBy);
+
+        Map<String, Object> authInfo = new HashMap<>();
+        authInfo.put(ResourceResolverFactory.SUBSERVICE, SERVICE_USER);
+        authInfo.put(ResourceResolverFactory.USER_IMPERSONATION, submittedBy);
+        
+        return resolverFactory.getServiceResourceResolver(authInfo);
     }
 
     // === Helper Methods ===
