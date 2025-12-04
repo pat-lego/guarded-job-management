@@ -20,43 +20,57 @@ Without ordering guarantees, Job 2 would be processed before Job 1, even though 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            HTTP Layer                                        │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐              │
-│  │ JobSubmitServlet│  │ JobStatusServlet│  │ JobListServlet  │              │
-│  │ POST .submit    │  │ GET .status     │  │ GET .list       │              │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘              │
-└───────────┼─────────────────────┼─────────────────────┼──────────────────────┘
-            │                     │                     │
-            ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Service Layer                                      │
-│                                                                              │
-│  ┌──────────────────────────┐      ┌─────────────────────────────────────┐  │
-│  │  GuardedOrderTokenService│      │        OrderedJobProcessor          │  │
-│  │  ┌────────────────────┐  │      │  ┌─────────────────────────────┐    │  │
-│  │  │ GuardedOrderToken  │  │      │  │      TopicExecutor (α)      │    │  │
-│  │  │ • generate()       │  │      │  │  ┌─────────────────────┐    │    │  │
-│  │  │ • isValid()        │◀─┼──────┼──│  │  OrderedJobQueue    │    │    │  │
-│  │  │ • extractTimestamp │  │      │  │  │  (TreeMap by time)  │    │    │  │
-│  │  │ • HMAC-SHA256 sign │  │      │  │  └─────────────────────┘    │    │  │
-│  │  └────────────────────┘  │      │  └─────────────────────────────┘    │  │
-│  └──────────────────────────┘      │  ┌─────────────────────────────┐    │  │
-│                                    │  │      TopicExecutor (β)      │    │  │
-│                                    │  │  (independent processing)   │    │  │
-│                                    │  └─────────────────────────────┘    │  │
-│                                    └─────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                       HTTP Layer (Any AEM Instance)                           │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐               │
+│  │ JobSubmitServlet│  │ JobStatusServlet│  │ JobListServlet  │               │
+│  │ POST .submit    │  │ GET .status     │  │ GET .list       │               │
+│  └────────┬────────┘  └─────────────────┘  └─────────────────┘               │
+└───────────┼──────────────────────────────────────────────────────────────────┘
             │
             ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            Job Layer                                         │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐              │
-│  │    EchoJob      │  │  EmptyGuardedJob│  │  Your Custom    │              │
-│  │   "echo"        │  │    "empty"      │  │     Jobs...     │              │
-│  └─────────────────┘  └─────────────────┘  └─────────────────┘              │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                      JCR Persistence (Shared Storage)                         │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                    JcrJobPersistenceService                            │  │
+│  │  /var/guarded-jobs/{sling-id}/{year}/{month}/{day}/{job-id}           │  │
+│  │    • topic, token, jobName, parameters (JSON blob)                    │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+            │
+            ▼ (polled by leader every jobPollIntervalMs)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                      Leader Instance Only (Processing)                        │
+│  ┌──────────────────────────┐      ┌─────────────────────────────────────┐   │
+│  │  GuardedOrderTokenService│      │        OrderedJobProcessor          │   │
+│  │  ┌────────────────────┐  │      │  1. Poll all jobs from JCR          │   │
+│  │  │ GuardedOrderToken  │  │      │  2. Sort by token timestamp         │   │
+│  │  │ • generate()       │  │      │  3. Execute per topic (sequential)  │   │
+│  │  │ • isValid()        │◀─┼──────│  4. Delete from JCR on complete     │   │
+│  │  │ • extractTimestamp │  │      │  ┌─────────────────────────────┐    │   │
+│  │  │ • HMAC-SHA256 sign │  │      │  │  ClusterLeaderService       │    │   │
+│  │  └────────────────────┘  │      │  │  (Sling Discovery API)      │    │   │
+│  └──────────────────────────┘      │  └─────────────────────────────┘    │   │
+│                                    └─────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            Job Implementations                                │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐               │
+│  │    EchoJob      │  │  EmptyGuardedJob│  │  Your Custom    │               │
+│  │   "echo"        │  │    "empty"      │  │     Jobs...     │               │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘               │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Job Processing Flow
+
+1. **Submit** (any instance): HTTP request → Generate token → Persist to JCR → Return "submitted"
+2. **Poll** (leader only): Every `jobPollIntervalMs`, leader loads all pending jobs from JCR
+3. **Sort**: Jobs sorted globally by token timestamp (ensures correct ordering)
+4. **Execute**: Jobs processed sequentially per topic, parallel across different topics
+5. **Cleanup**: Job deleted from JCR after execution (success or failure)
 
 ## 🔑 Key Concepts
 
@@ -151,11 +165,12 @@ public class PublishPageJob implements GuardedJob<String> {
 }
 ```
 
-### JobProcessor
-Orchestrates job submission and ordered execution.
-
-### OrderedJobQueue
-Thread-safe queue that maintains jobs sorted by token timestamp.
+### JobProcessor / OrderedJobProcessor
+Orchestrates job submission and ordered execution:
+- **Submit**: Persists job to JCR and returns immediately (fire-and-forget)
+- **Poll**: Leader instance polls JCR at configured intervals
+- **Execute**: Processes jobs sequentially per topic, with configurable timeout
+- **Cleanup**: Removes jobs from JCR after execution
 
 ## 🚀 HTTP API
 
@@ -245,7 +260,8 @@ Configure the coalesce timing and job timeout:
 ```json
 {
     "coalesceTimeMs": 50,
-    "jobTimeoutSeconds": 30
+    "jobTimeoutSeconds": 30,
+    "jobPollIntervalMs": 1000
 }
 ```
 
@@ -253,6 +269,7 @@ Configure the coalesce timing and job timeout:
 |----------|---------|-------------|
 | `coalesceTimeMs` | 50 | Milliseconds to wait for more jobs before processing starts |
 | `jobTimeoutSeconds` | 30 | Maximum time (in seconds) a job can run before being cancelled. Set to 0 to disable. |
+| `jobPollIntervalMs` | 1000 | How often the leader polls JCR for new jobs (in milliseconds) |
 
 #### Understanding `coalesceTimeMs`
 
@@ -314,55 +331,80 @@ WARN  Job 'slow-task' in topic 'my-topic' cancelled after 30 seconds (timeout: 3
       This may indicate a long-running or stuck job that could cause queue bottlenecking and high heap usage.
 ```
 
-### JcrJobPersistenceService (Optional)
+### JcrJobPersistenceService
 
-Enable job persistence for durability across JVM restarts:
+Job persistence is the **core mechanism** for distributed job processing. All jobs are persisted to JCR, ensuring durability across JVM restarts and global ordering across all AEM instances.
 
-**OSGi Config:** `com.adobe.aem.support.core.guards.persistence.impl.JcrJobPersistenceService.cfg.json`
+> **Note:** Jobs are always stored at `/var/guarded-jobs` using the `guarded-job-service` service user. This is not configurable to ensure consistent behavior across all instances.
 
-```json
-{
-    "enabled": false
-}
-```
+#### How It Works (Distributed Architecture)
 
-| Property | Default | Description |
-|----------|---------|-------------|
-| `enabled` | false | Enable job persistence (disabled by default) |
-
-> **Note:** Jobs are always stored at `/var/guarded-jobs` using the `guarded-job-service` service user. These are not configurable to ensure consistent behavior.
-
-#### How Persistence Works
-
-When enabled, jobs are passivated to the JCR repository:
+Jobs flow through a distributed pipeline that ensures **global ordering** across all AEM instances:
 
 ```
-Job Submitted ──▶ Persisted to JCR ──▶ Processing ──▶ Removed from JCR
-                        │
-                        │ (JVM crashes/restarts)
-                        ▼
-                  On Startup: Load persisted jobs ──▶ Resubmit for processing
+┌─────────────────────────────────────────────────────────────────┐
+│                     ANY AEM INSTANCE                             │
+│  HTTP Request ──▶ Persist to JCR ──▶ Return "submitted"         │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                        ┌──────────┐
+                        │   JCR    │  (Shared Storage)
+                        │ /var/... │
+                        └──────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   LEADER INSTANCE ONLY                           │
+│  Poll JCR ──▶ Sort by token ──▶ Process in order ──▶ Delete     │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+**Why only the leader processes:**
+- Ensures **global ordering** across all instances
+- Two jobs submitted to different instances will be processed in token order
+- Prevents race conditions where instances could process the same job
+
+**On JVM restart:**
+- Leader polls JCR and picks up any unprocessed jobs
+- Jobs are processed in correct token order
 
 **Storage structure:**
 ```
 /var/guarded-jobs/
-  my-topic/
-    550e8400-e29b-41d4-a716-446655440000/
-      - token: "1733325600001.kX9mQz..."
-      - jobName: "echo"
-      - persistedAt: 1733325600000
-      - parameters: (binary JSON blob)
+  {sling-id}/                              # Instance that created the job
+    2024/                                  # Year
+      12/                                  # Month
+        04/                                # Day
+          550e8400-e29b-41d4-a716-446655440000/
+            - topic: "my-topic"
+            - token: "1733325600001.kX9mQz..."
+            - jobName: "echo"
+            - persistedAt: 1733325600000
+            - parameters: (binary JSON blob)
 ```
 
-**When to enable persistence:**
+> **Note:** Jobs are organized by date to prevent large node trees. Only the **cluster leader** can recover and process persisted jobs on startup.
 
-| Scenario | Recommendation |
-|----------|----------------|
-| Development/testing | Disabled (default) |
-| Non-critical jobs | Disabled |
-| Critical business operations | **Enabled** |
-| Jobs that must not be lost | **Enabled** |
+#### Cluster Leadership
+
+The `ClusterLeaderService` determines which AEM instance is the leader using the Sling Discovery API:
+
+```java
+@Reference
+private ClusterLeaderService clusterLeaderService;
+
+public void doLeaderOnlyWork() {
+    if (!clusterLeaderService.isLeader()) {
+        return; // Not the leader, skip
+    }
+    // Perform work that should only run on one instance
+}
+```
+
+- In **single-instance** deployments: always returns `true`
+- In **clustered** deployments: only one instance returns `true`
+- Leadership can change dynamically when instances join/leave the cluster
 
 #### Automatic Setup via Repo Init
 
@@ -394,7 +436,7 @@ end
 }
 ```
 
-No manual setup required — just deploy the package and enable persistence!
+No manual setup required — just deploy the package and jobs will be automatically persisted and processed!
 
 ## 🧪 Testing with Scripts
 
@@ -456,9 +498,13 @@ guarded-job-management/
 │       ├── service/
 │       │   ├── GuardedJob.java                  # Job interface
 │       │   ├── JobProcessor.java                # Processor interface
-│       │   ├── OrderedJobQueue.java             # Ordered queue
+│       │   ├── OrderedJobQueue.java             # Utility (not used in main flow)
 │       │   └── impl/
-│       │       └── OrderedJobProcessor.java     # Main processor
+│       │       └── OrderedJobProcessor.java     # Main processor (JCR-based)
+│       ├── cluster/
+│       │   ├── ClusterLeaderService.java        # Leadership detection interface
+│       │   └── impl/
+│       │       └── ClusterLeaderServiceImpl.java # Sling Discovery implementation
 │       ├── persistence/
 │       │   ├── JobPersistenceService.java       # Persistence interface
 │       │   └── impl/
@@ -474,7 +520,6 @@ guarded-job-management/
 │   └── src/main/content/jcr_root/apps/.../osgiconfig/
 │       ├── com.adobe.aem.support.core.guards.token.impl.GuardedOrderTokenServiceImpl.cfg.json
 │       ├── com.adobe.aem.support.core.guards.service.impl.OrderedJobProcessor.cfg.json
-│       ├── com.adobe.aem.support.core.guards.persistence.impl.JcrJobPersistenceService.cfg.json
 │       ├── org.apache.sling.serviceusermapping.impl.ServiceUserMapperImpl.amended-guarded-job-management.cfg.json
 │       └── org.apache.sling.jcr.repoinit.RepositoryInitializer~guarded-job-management.cfg.json
 ├── scripts/

@@ -1,5 +1,6 @@
 {
     "coalesceTimeMs": 50,
-    "jobTimeoutSeconds": 30
+    "jobTimeoutSeconds": 30,
+    "jobPollIntervalMs": 1000
 }
 

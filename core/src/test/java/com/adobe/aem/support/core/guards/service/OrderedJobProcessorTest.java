@@ -1,34 +1,59 @@
 package com.adobe.aem.support.core.guards.service;
 
+import com.adobe.aem.support.core.guards.cluster.ClusterLeaderService;
+import com.adobe.aem.support.core.guards.persistence.JobPersistenceService;
+import com.adobe.aem.support.core.guards.persistence.JobPersistenceService.JobPersistenceException;
+import com.adobe.aem.support.core.guards.persistence.JobPersistenceService.PersistedJob;
 import com.adobe.aem.support.core.guards.service.impl.OrderedJobProcessor;
 import com.adobe.aem.support.core.guards.token.GuardedOrderToken;
 import com.adobe.aem.support.core.guards.token.GuardedOrderTokenService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.*;
 
 class OrderedJobProcessorTest {
 
     private static final String SECRET_KEY = "test-secret-key";
     private GuardedOrderTokenService tokenService;
+    private JobPersistenceService persistenceService;
+    private ClusterLeaderService clusterLeaderService;
     private OrderedJobProcessor processor;
 
     @BeforeEach
     void setUp() throws Exception {
         tokenService = new TestTokenService(SECRET_KEY);
+        persistenceService = mock(JobPersistenceService.class);
+        clusterLeaderService = mock(ClusterLeaderService.class);
         processor = new OrderedJobProcessor();
         
-        // Inject the token service via reflection (simulating OSGi injection)
+        // Set up leader service to return true (we are the leader)
+        when(clusterLeaderService.isLeader()).thenReturn(true);
+        when(clusterLeaderService.getSlingId()).thenReturn("test-sling-id");
+        
+        // Inject the token service via reflection
         Field tokenServiceField = OrderedJobProcessor.class.getDeclaredField("tokenService");
         tokenServiceField.setAccessible(true);
         tokenServiceField.set(processor, tokenService);
+        
+        // Inject the persistence service via reflection
+        Field persistenceServiceField = OrderedJobProcessor.class.getDeclaredField("persistenceService");
+        persistenceServiceField.setAccessible(true);
+        persistenceServiceField.set(processor, persistenceService);
+        
+        // Inject the cluster leader service via reflection
+        Field clusterLeaderServiceField = OrderedJobProcessor.class.getDeclaredField("clusterLeaderService");
+        clusterLeaderServiceField.setAccessible(true);
+        clusterLeaderServiceField.set(processor, clusterLeaderService);
         
         // Find the Config interface by name
         Class<?> configClass = findConfigClass();
@@ -37,16 +62,18 @@ class OrderedJobProcessorTest {
         java.lang.reflect.Method activateMethod = OrderedJobProcessor.class.getDeclaredMethod("activate", configClass);
         activateMethod.setAccessible(true);
         
-        // Create a proxy for the Config interface
         Object configProxy = java.lang.reflect.Proxy.newProxyInstance(
             OrderedJobProcessor.class.getClassLoader(),
             new Class<?>[] { configClass },
             (proxy, method, args) -> {
                 if ("coalesceTimeMs".equals(method.getName())) {
-                    return 10L; // 10ms coalesce time for tests
+                    return 10L;
                 }
                 if ("jobTimeoutSeconds".equals(method.getName())) {
-                    return 30L; // 30s timeout for tests
+                    return 30L;
+                }
+                if ("jobPollIntervalMs".equals(method.getName())) {
+                    return 100L; // Fast polling for tests
                 }
                 return null;
             }
@@ -70,96 +97,14 @@ class OrderedJobProcessorTest {
         }
     }
 
-    @Test
-    void submit_executesJob() throws Exception {
-        String token = tokenService.generateToken();
-        
-        CompletableFuture<String> future = processor.submit("topic", token, 
-            testJob("test", params -> "result"), Collections.emptyMap());
-        
-        assertEquals("result", future.get(5, TimeUnit.SECONDS));
-    }
-
-    @Test
-    void submit_processesInTokenOrder() throws Exception {
-        List<String> executionOrder = Collections.synchronizedList(new ArrayList<>());
-        
-        // Generate tokens in order
-        String token1 = tokenService.generateToken();
-        String token2 = tokenService.generateToken();
-        String token3 = tokenService.generateToken();
-        
-        // Submit in reverse order
-        CompletableFuture<Void> future3 = processor.submit("topic", token3, 
-            testJob("job3", params -> {
-                executionOrder.add("third");
-                return null;
-            }), Collections.emptyMap());
-        
-        CompletableFuture<Void> future2 = processor.submit("topic", token2, 
-            testJob("job2", params -> {
-                executionOrder.add("second");
-                return null;
-            }), Collections.emptyMap());
-        
-        CompletableFuture<Void> future1 = processor.submit("topic", token1, 
-            testJob("job1", params -> {
-                executionOrder.add("first");
-                return null;
-            }), Collections.emptyMap());
-        
-        CompletableFuture.allOf(future1, future2, future3).get(5, TimeUnit.SECONDS);
-        
-        assertEquals(List.of("first", "second", "third"), executionOrder);
-    }
-
-    @Test
-    void submit_differentTopicsAreIndependent() throws Exception {
-        List<String> topicAOrder = Collections.synchronizedList(new ArrayList<>());
-        List<String> topicBOrder = Collections.synchronizedList(new ArrayList<>());
-        
-        // Generate tokens
-        String tokenA1 = tokenService.generateToken();
-        String tokenA2 = tokenService.generateToken();
-        String tokenB1 = tokenService.generateToken();
-        String tokenB2 = tokenService.generateToken();
-        
-        // Submit in reverse order for topic-a
-        CompletableFuture<Void> futureA2 = processor.submit("topic-a", tokenA2, 
-            testJob("a2", params -> {
-                topicAOrder.add("A2");
-                return null;
-            }), Collections.emptyMap());
-        CompletableFuture<Void> futureA1 = processor.submit("topic-a", tokenA1, 
-            testJob("a1", params -> {
-                topicAOrder.add("A1");
-                return null;
-            }), Collections.emptyMap());
-        
-        // Submit in reverse order for topic-b
-        CompletableFuture<Void> futureB2 = processor.submit("topic-b", tokenB2, 
-            testJob("b2", params -> {
-                topicBOrder.add("B2");
-                return null;
-            }), Collections.emptyMap());
-        CompletableFuture<Void> futureB1 = processor.submit("topic-b", tokenB1, 
-            testJob("b1", params -> {
-                topicBOrder.add("B1");
-                return null;
-            }), Collections.emptyMap());
-        
-        CompletableFuture.allOf(futureA1, futureA2, futureB1, futureB2).get(5, TimeUnit.SECONDS);
-        
-        assertEquals(List.of("A1", "A2"), topicAOrder);
-        assertEquals(List.of("B1", "B2"), topicBOrder);
-    }
+    // === Validation Tests ===
 
     @Test
     void submit_throwsForNullTopic() {
         String token = tokenService.generateToken();
         
         assertThrows(IllegalArgumentException.class, 
-            () -> processor.submit(null, token, testJob("test", p -> "result"), Collections.emptyMap()));
+            () -> processor.submit(null, token, testJob("test"), Collections.emptyMap()));
     }
 
     @Test
@@ -167,21 +112,21 @@ class OrderedJobProcessorTest {
         String token = tokenService.generateToken();
         
         assertThrows(IllegalArgumentException.class, 
-            () -> processor.submit("", token, testJob("test", p -> "result"), Collections.emptyMap()));
+            () -> processor.submit("", token, testJob("test"), Collections.emptyMap()));
         assertThrows(IllegalArgumentException.class, 
-            () -> processor.submit("   ", token, testJob("test", p -> "result"), Collections.emptyMap()));
+            () -> processor.submit("   ", token, testJob("test"), Collections.emptyMap()));
     }
 
     @Test
     void submit_throwsForNullToken() {
         assertThrows(IllegalArgumentException.class, 
-            () -> processor.submit("topic", null, testJob("test", p -> "result"), Collections.emptyMap()));
+            () -> processor.submit("topic", null, testJob("test"), Collections.emptyMap()));
     }
 
     @Test
     void submit_throwsForInvalidToken() {
         assertThrows(IllegalArgumentException.class, 
-            () -> processor.submit("topic", "invalid-token", testJob("test", p -> "result"), Collections.emptyMap()));
+            () -> processor.submit("topic", "invalid-token", testJob("test"), Collections.emptyMap()));
     }
 
     @Test
@@ -191,7 +136,7 @@ class OrderedJobProcessorTest {
         String tamperedToken = (Long.parseLong(parts[0]) + 1000) + "." + parts[1];
         
         assertThrows(IllegalArgumentException.class, 
-            () -> processor.submit("topic", tamperedToken, testJob("test", p -> "result"), Collections.emptyMap()));
+            () -> processor.submit("topic", tamperedToken, testJob("test"), Collections.emptyMap()));
     }
 
     @Test
@@ -202,91 +147,59 @@ class OrderedJobProcessorTest {
             () -> processor.submit("topic", token, null, Collections.emptyMap()));
     }
 
+    // === Persistence Tests ===
+
     @Test
-    void submit_jobExceptionPropagates() {
+    void submit_persistsJobToJcr() throws Exception {
         String token = tokenService.generateToken();
-        RuntimeException expectedException = new RuntimeException("Job failed");
+        String expectedId = "/var/guarded-jobs/test-id";
+        
+        when(persistenceService.persist(eq("topic"), eq(token), eq("test-job"), any()))
+            .thenReturn(expectedId);
         
         CompletableFuture<String> future = processor.submit("topic", token, 
-            testJob("failing", params -> {
-                throw expectedException;
-            }), Collections.emptyMap());
+            testJob("test-job"), Map.of("key", "value"));
+        
+        // Job is persisted, future completes with null (fire-and-forget)
+        assertNull(future.get(1, TimeUnit.SECONDS));
+        
+        // Verify persistence was called
+        verify(persistenceService).persist(eq("topic"), eq(token), eq("test-job"), any());
+    }
+
+    @Test
+    void submit_failsWhenPersistenceFails() throws Exception {
+        String token = tokenService.generateToken();
+        
+        when(persistenceService.persist(any(), any(), any(), any()))
+            .thenThrow(new JobPersistenceException("Persistence failed"));
+        
+        CompletableFuture<String> future = processor.submit("topic", token, 
+            testJob("test-job"), Collections.emptyMap());
         
         ExecutionException ex = assertThrows(ExecutionException.class, 
-            () -> future.get(5, TimeUnit.SECONDS));
-        assertEquals(expectedException, ex.getCause());
+            () -> future.get(1, TimeUnit.SECONDS));
+        assertTrue(ex.getCause() instanceof JobPersistenceException);
     }
 
     @Test
-    void getPendingCount_returnsCorrectCount() throws Exception {
-        CountDownLatch jobStarted = new CountDownLatch(1);
-        CountDownLatch jobCanFinish = new CountDownLatch(1);
+    void submit_capturesCorrectParameters() throws Exception {
+        String token = tokenService.generateToken();
+        Map<String, Object> params = Map.of("message", "hello", "count", 42);
         
-        String token1 = tokenService.generateToken();
-        String token2 = tokenService.generateToken();
+        when(persistenceService.persist(any(), any(), any(), any()))
+            .thenReturn("/var/guarded-jobs/id");
         
-        // First job blocks
-        processor.submit("topic", token1, testJob("blocking", params -> {
-            jobStarted.countDown();
-            try {
-                jobCanFinish.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            return null;
-        }), Collections.emptyMap());
+        processor.submit("my-topic", token, testJob("my-job"), params);
         
-        // Wait for first job to start
-        jobStarted.await(5, TimeUnit.SECONDS);
+        ArgumentCaptor<Map<String, Object>> paramsCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(persistenceService).persist(eq("my-topic"), eq(token), eq("my-job"), paramsCaptor.capture());
         
-        // Submit second job - should be pending
-        processor.submit("topic", token2, testJob("pending", params -> null), Collections.emptyMap());
-        
-        assertTrue(processor.getPendingCount("topic") >= 1);
-        
-        jobCanFinish.countDown();
+        assertEquals("hello", paramsCaptor.getValue().get("message"));
+        assertEquals(42, paramsCaptor.getValue().get("count"));
     }
 
-    @Test
-    void getTotalPendingCount_sumsAllTopics() throws Exception {
-        CountDownLatch jobsStarted = new CountDownLatch(2);
-        CountDownLatch jobsCanFinish = new CountDownLatch(1);
-        
-        String tokenA1 = tokenService.generateToken();
-        String tokenA2 = tokenService.generateToken();
-        String tokenB1 = tokenService.generateToken();
-        String tokenB2 = tokenService.generateToken();
-        
-        // Block first job in each topic
-        processor.submit("topic-a", tokenA1, testJob("blockA", params -> {
-            jobsStarted.countDown();
-            try {
-                jobsCanFinish.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            return null;
-        }), Collections.emptyMap());
-        processor.submit("topic-b", tokenB1, testJob("blockB", params -> {
-            jobsStarted.countDown();
-            try {
-                jobsCanFinish.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            return null;
-        }), Collections.emptyMap());
-        
-        jobsStarted.await(5, TimeUnit.SECONDS);
-        
-        // Submit more jobs
-        processor.submit("topic-a", tokenA2, testJob("pendA", params -> null), Collections.emptyMap());
-        processor.submit("topic-b", tokenB2, testJob("pendB", params -> null), Collections.emptyMap());
-        
-        assertTrue(processor.getTotalPendingCount() >= 2);
-        
-        jobsCanFinish.countDown();
-    }
+    // === Shutdown Tests ===
 
     @Test
     void shutdown_rejectsNewJobs() {
@@ -294,124 +207,217 @@ class OrderedJobProcessorTest {
         
         String token = tokenService.generateToken();
         CompletableFuture<String> future = processor.submit("topic", token, 
-            testJob("test", params -> "result"), Collections.emptyMap());
+            testJob("test"), Collections.emptyMap());
         
-        assertThrows(ExecutionException.class, () -> future.get(5, TimeUnit.SECONDS));
+        assertThrows(ExecutionException.class, () -> future.get(1, TimeUnit.SECONDS));
     }
 
     @Test
     void isShutdown_returnsTrueAfterShutdown() {
         assertFalse(processor.isShutdown());
-        
         processor.shutdown();
-        
         assertTrue(processor.isShutdown());
     }
 
     @Test
-    void submit_jobTimesOutAndIsCancelled() throws Exception {
-        // Create a processor with very short timeout
-        OrderedJobProcessor shortTimeoutProcessor = new OrderedJobProcessor();
-        
-        Field tokenServiceField = OrderedJobProcessor.class.getDeclaredField("tokenService");
-        tokenServiceField.setAccessible(true);
-        tokenServiceField.set(shortTimeoutProcessor, tokenService);
-        
-        Class<?> configClass = findConfigClass();
-        java.lang.reflect.Method activateMethod = OrderedJobProcessor.class.getDeclaredMethod("activate", configClass);
-        activateMethod.setAccessible(true);
-        
-        Object configProxy = java.lang.reflect.Proxy.newProxyInstance(
-            OrderedJobProcessor.class.getClassLoader(),
-            new Class<?>[] { configClass },
-            (proxy, method, args) -> {
-                if ("coalesceTimeMs".equals(method.getName())) {
-                    return 10L;
-                }
-                if ("jobTimeoutSeconds".equals(method.getName())) {
-                    return 1L; // 1 second timeout
-                }
-                return null;
+    void isShutdown_returnsTrueAfterShutdownNow() {
+        assertFalse(processor.isShutdown());
+        processor.shutdownNow();
+        assertTrue(processor.isShutdown());
+    }
+
+    // === Polling and Processing Tests ===
+
+    @Test
+    void pollAndProcess_executesJobsFromJcr() throws Exception {
+        // Register a job implementation
+        CountDownLatch jobExecuted = new CountDownLatch(1);
+        GuardedJob<String> job = new GuardedJob<String>() {
+            @Override
+            public String getName() { return "test-job"; }
+            @Override
+            public String execute(Map<String, Object> parameters) {
+                jobExecuted.countDown();
+                return "done";
             }
-        );
-        activateMethod.invoke(shortTimeoutProcessor, configProxy);
+        };
         
-        try {
-            String token = tokenService.generateToken();
-            
-            CompletableFuture<String> future = shortTimeoutProcessor.submit("topic", token, 
-                new GuardedJob<String>() {
-                    @Override
-                    public String getName() {
-                        return "slow-job";
-                    }
-                    
-                    @Override
-                    public String execute(Map<String, Object> parameters) throws Exception {
-                        Thread.sleep(10000); // Sleep for 10 seconds - will be interrupted
-                        return "completed";
-                    }
-                }, Collections.emptyMap());
-            
-            // Should throw TimeoutException wrapped in ExecutionException
-            ExecutionException ex = assertThrows(ExecutionException.class, 
-                () -> future.get(5, TimeUnit.SECONDS));
-            assertTrue(ex.getCause() instanceof TimeoutException);
-            assertTrue(ex.getCause().getMessage().contains("cancelled"));
-        } finally {
-            shortTimeoutProcessor.shutdownNow();
-        }
+        // Register via reflection
+        Field registeredJobsField = OrderedJobProcessor.class.getDeclaredField("registeredJobs");
+        registeredJobsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, GuardedJob<?>> registeredJobs = (Map<String, GuardedJob<?>>) registeredJobsField.get(processor);
+        registeredJobs.put("test-job", job);
+        
+        // Set up persisted job
+        String token = tokenService.generateToken();
+        PersistedJob persistedJob = new PersistedJob(
+            "/var/guarded-jobs/job-1",
+            "topic",
+            token,
+            "test-job",
+            Map.of(),
+            System.currentTimeMillis()
+        );
+        
+        when(persistenceService.loadAll())
+            .thenReturn(List.of(persistedJob))
+            .thenReturn(List.of()); // Empty after first poll
+        
+        // Manually trigger poll to avoid timing issues
+        java.lang.reflect.Method pollMethod = OrderedJobProcessor.class.getDeclaredMethod("pollAndProcessJobs");
+        pollMethod.setAccessible(true);
+        pollMethod.invoke(processor);
+        
+        // Wait for job execution (jobs run in separate threads)
+        assertTrue(jobExecuted.await(5, TimeUnit.SECONDS));
+        
+        // Verify job was removed from persistence
+        verify(persistenceService, timeout(5000)).remove("/var/guarded-jobs/job-1");
     }
 
     @Test
-    void submit_manyJobsProcessInTokenOrder() throws Exception {
-        List<Integer> executionOrder = Collections.synchronizedList(new ArrayList<>());
-        List<String> tokens = new ArrayList<>();
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
+    void pollAndProcess_processesJobsInTokenOrder() throws Exception {
+        List<String> executionOrder = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch allJobsComplete = new CountDownLatch(3);
         
-        // Generate 100 tokens in order
-        for (int i = 0; i < 100; i++) {
-            tokens.add(tokenService.generateToken());
+        // Create jobs that track execution order
+        for (String name : List.of("job1", "job2", "job3")) {
+            GuardedJob<String> job = new GuardedJob<String>() {
+                @Override
+                public String getName() { return name; }
+                @Override
+                public String execute(Map<String, Object> parameters) {
+                    executionOrder.add(name);
+                    allJobsComplete.countDown();
+                    return "done";
+                }
+            };
+            
+            Field registeredJobsField = OrderedJobProcessor.class.getDeclaredField("registeredJobs");
+            registeredJobsField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, GuardedJob<?>> registeredJobs = (Map<String, GuardedJob<?>>) registeredJobsField.get(processor);
+            registeredJobs.put(name, job);
         }
         
-        // Shuffle and submit
-        List<Integer> indices = new ArrayList<>();
-        for (int i = 0; i < 100; i++) {
-            indices.add(i);
-        }
-        Collections.shuffle(indices);
+        // Generate tokens in order
+        String token1 = tokenService.generateToken();
+        String token2 = tokenService.generateToken();
+        String token3 = tokenService.generateToken();
         
-        for (int idx : indices) {
-            final int index = idx;
-            futures.add(processor.submit("topic", tokens.get(idx), 
-                testJob("job" + idx, params -> {
-                    executionOrder.add(index);
-                    return null;
-                }), Collections.emptyMap()));
-        }
+        // Create persisted jobs - note: returned in different order
+        List<PersistedJob> persistedJobs = List.of(
+            new PersistedJob("/var/guarded-jobs/3", "topic", token3, "job3", Map.of(), System.currentTimeMillis()),
+            new PersistedJob("/var/guarded-jobs/1", "topic", token1, "job1", Map.of(), System.currentTimeMillis()),
+            new PersistedJob("/var/guarded-jobs/2", "topic", token2, "job2", Map.of(), System.currentTimeMillis())
+        );
         
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.SECONDS);
+        when(persistenceService.loadAll())
+            .thenReturn(persistedJobs)
+            .thenReturn(List.of()); // Empty after processing
         
-        List<Integer> expected = new ArrayList<>();
-        for (int i = 0; i < 100; i++) {
-            expected.add(i);
-        }
-        assertEquals(expected, executionOrder);
+        // Manually trigger poll
+        java.lang.reflect.Method pollMethod = OrderedJobProcessor.class.getDeclaredMethod("pollAndProcessJobs");
+        pollMethod.setAccessible(true);
+        pollMethod.invoke(processor);
+        
+        // Wait for all jobs to complete
+        assertTrue(allJobsComplete.await(5, TimeUnit.SECONDS));
+        
+        // Should be processed in token order
+        assertEquals(List.of("job1", "job2", "job3"), executionOrder);
     }
 
-    /**
-     * Helper to create a test GuardedJob.
-     */
-    private <T> GuardedJob<T> testJob(String name, Function<Map<String, Object>, T> executor) {
-        return new GuardedJob<T>() {
+    @Test
+    void pollAndProcess_removesOrphanedJobs() throws Exception {
+        String token = tokenService.generateToken();
+        
+        // No registered implementation for "unknown-job"
+        PersistedJob orphanedJob = new PersistedJob(
+            "/var/guarded-jobs/orphan",
+            "topic",
+            token,
+            "unknown-job",
+            Map.of(),
+            System.currentTimeMillis()
+        );
+        
+        when(persistenceService.loadAll())
+            .thenReturn(List.of(orphanedJob))
+            .thenReturn(List.of());
+        
+        // Manually trigger poll
+        java.lang.reflect.Method pollMethod = OrderedJobProcessor.class.getDeclaredMethod("pollAndProcessJobs");
+        pollMethod.setAccessible(true);
+        pollMethod.invoke(processor);
+        
+        // Orphaned job should be removed immediately
+        verify(persistenceService).remove("/var/guarded-jobs/orphan");
+    }
+
+    // === Pending Count Tests ===
+
+    @Test
+    void getPendingCount_returnsZeroWhenNoJobs() throws Exception {
+        when(persistenceService.loadAll()).thenReturn(List.of());
+        
+        assertEquals(0, processor.getPendingCount("topic"));
+    }
+
+    @Test
+    void getTotalPendingCount_returnsZeroWhenNoJobs() throws Exception {
+        when(persistenceService.loadAll()).thenReturn(List.of());
+        
+        assertEquals(0, processor.getTotalPendingCount());
+    }
+
+    @Test
+    void getPendingCount_countsJobsForTopic() throws Exception {
+        String token1 = tokenService.generateToken();
+        String token2 = tokenService.generateToken();
+        String token3 = tokenService.generateToken();
+        
+        List<PersistedJob> jobs = List.of(
+            new PersistedJob("/id1", "topic-a", token1, "job", Map.of(), 0),
+            new PersistedJob("/id2", "topic-a", token2, "job", Map.of(), 0),
+            new PersistedJob("/id3", "topic-b", token3, "job", Map.of(), 0)
+        );
+        
+        when(persistenceService.loadAll()).thenReturn(jobs);
+        
+        assertEquals(2, processor.getPendingCount("topic-a"));
+        assertEquals(1, processor.getPendingCount("topic-b"));
+        assertEquals(0, processor.getPendingCount("topic-c"));
+    }
+
+    @Test
+    void getTotalPendingCount_countsAllJobs() throws Exception {
+        String token1 = tokenService.generateToken();
+        String token2 = tokenService.generateToken();
+        
+        List<PersistedJob> jobs = List.of(
+            new PersistedJob("/id1", "topic-a", token1, "job", Map.of(), 0),
+            new PersistedJob("/id2", "topic-b", token2, "job", Map.of(), 0)
+        );
+        
+        when(persistenceService.loadAll()).thenReturn(jobs);
+        
+        assertEquals(2, processor.getTotalPendingCount());
+    }
+
+    // === Helper Methods ===
+
+    private GuardedJob<String> testJob(String name) {
+        return new GuardedJob<String>() {
             @Override
             public String getName() {
                 return name;
             }
 
             @Override
-            public T execute(Map<String, Object> parameters) throws Exception {
-                return executor.apply(parameters);
+            public String execute(Map<String, Object> parameters) {
+                return "result";
             }
         };
     }

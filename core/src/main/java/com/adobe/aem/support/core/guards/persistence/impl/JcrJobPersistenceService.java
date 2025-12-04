@@ -1,51 +1,57 @@
 package com.adobe.aem.support.core.guards.persistence.impl;
 
+import com.adobe.aem.support.core.guards.cluster.ClusterLeaderService;
 import com.adobe.aem.support.core.guards.persistence.JobPersistenceService;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.reflect.TypeToken;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.sling.api.resource.*;
-import org.osgi.service.component.annotations.*;
-import org.osgi.service.metatype.annotations.AttributeDefinition;
-import org.osgi.service.metatype.annotations.Designate;
-import org.osgi.service.metatype.annotations.ObjectClassDefinition;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
-import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.*;
 
 /**
  * JCR-based implementation of {@link JobPersistenceService}.
  * 
- * <p>Stores jobs as JSON blobs under a configurable path in the repository.
- * Each job is stored as a node with properties for metadata and a binary
- * property containing the serialized parameters.</p>
+ * <p>This service is always enabled and persists all jobs to JCR for durability.
+ * Jobs are stored as JSON blobs organized by Sling ID and date to prevent large node trees.
+ * Only the cluster leader can recover and process persisted jobs.</p>
  * 
  * <p>Storage structure:
  * <pre>
  * /var/guarded-jobs/
- *   {topic}/
- *     {job-id}/
- *       - jcr:primaryType = nt:unstructured
- *       - token = "..."
- *       - jobName = "echo"
- *       - persistedAt = 1733325600000
- *       - parameters (binary JSON blob)
+ *   {sling-id}/
+ *     {year}/
+ *       {month}/
+ *         {day}/
+ *           {job-id}/
+ *             - jcr:primaryType = nt:unstructured
+ *             - topic = "my-topic"
+ *             - token = "..."
+ *             - jobName = "echo"
+ *             - persistedAt = 1733325600000
+ *             - parameters (binary JSON blob)
  * </pre>
  * </p>
  */
 @Component(service = JobPersistenceService.class, immediate = true)
-@Designate(ocd = JcrJobPersistenceService.Config.class)
 public class JcrJobPersistenceService implements JobPersistenceService {
 
     private static final Logger LOG = LoggerFactory.getLogger(JcrJobPersistenceService.class);
-    private static final Gson GSON = new GsonBuilder().create();
-    private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {}.getType();
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
 
+    private static final String PROP_TOPIC = "topic";
     private static final String PROP_TOKEN = "token";
     private static final String PROP_JOB_NAME = "jobName";
     private static final String PROP_PERSISTED_AT = "persistedAt";
@@ -55,78 +61,62 @@ public class JcrJobPersistenceService implements JobPersistenceService {
     private static final String STORAGE_PATH = "/var/guarded-jobs";
     private static final String SERVICE_USER = "guarded-job-service";
 
-    @ObjectClassDefinition(
-        name = "Guarded Job Persistence Service",
-        description = "Configuration for persisting jobs to JCR for durability across restarts"
-    )
-    @interface Config {
-        @AttributeDefinition(
-            name = "Enabled",
-            description = "Enable job persistence. When disabled, jobs are not persisted and will be lost on restart."
-        )
-        boolean enabled() default false;
-    }
-
     @Reference
     private ResourceResolverFactory resolverFactory;
 
-    private boolean enabled;
+    @Reference
+    private ClusterLeaderService clusterLeaderService;
 
     @Activate
-    protected void activate(Config config) {
-        this.enabled = config.enabled();
+    protected void activate() {
+        LOG.info("JcrJobPersistenceService activated: slingId={}, storagePath={}", 
+            clusterLeaderService.getSlingId(), STORAGE_PATH);
         
-        LOG.info("JcrJobPersistenceService activated: enabled={}, storagePath={}, serviceUser={}", 
-            enabled, STORAGE_PATH, SERVICE_USER);
-        
-        if (enabled) {
-            ensureStoragePathExists();
-        }
+        ensureStoragePathExists();
     }
 
     @Override
     public boolean isEnabled() {
-        return enabled;
+        return true; // Always enabled
     }
 
     @Override
     public String persist(String topic, String token, String jobName, Map<String, Object> parameters) 
             throws JobPersistenceException {
-        
-        if (!enabled) {
-            return null;
-        }
 
+        String slingId = clusterLeaderService.getSlingId();
         String jobId = UUID.randomUUID().toString();
-        String jobPath = STORAGE_PATH + "/" + sanitize(topic) + "/" + jobId;
+        String datePath = buildDatePath();
+        String jobPath = STORAGE_PATH + "/" + slingId + "/" + datePath + "/" + jobId;
 
         try (ResourceResolver resolver = getServiceResolver()) {
-            // Ensure topic folder exists
-            String topicPath = STORAGE_PATH + "/" + sanitize(topic);
-            ensurePathExists(resolver, topicPath);
+            // Ensure date-based folder structure exists
+            String parentPath = STORAGE_PATH + "/" + slingId + "/" + datePath;
+            ensurePathExists(resolver, parentPath);
 
             // Create job node
-            Resource topicResource = resolver.getResource(topicPath);
-            if (topicResource == null) {
-                throw new JobPersistenceException("Failed to access topic path: " + topicPath);
+            Resource parentResource = resolver.getResource(parentPath);
+            if (parentResource == null) {
+                throw new JobPersistenceException("Failed to access parent path: " + parentPath);
             }
 
             Map<String, Object> properties = new HashMap<>();
             properties.put(ResourceResolver.PROPERTY_RESOURCE_TYPE, NT_UNSTRUCTURED);
+            properties.put(PROP_TOPIC, topic);
             properties.put(PROP_TOKEN, token);
             properties.put(PROP_JOB_NAME, jobName);
             properties.put(PROP_PERSISTED_AT, System.currentTimeMillis());
             
             // Store parameters as JSON blob
-            String parametersJson = GSON.toJson(parameters);
+            String parametersJson = serializeParameters(parameters);
             InputStream parametersStream = new ByteArrayInputStream(
                 parametersJson.getBytes(StandardCharsets.UTF_8));
             properties.put(PROP_PARAMETERS, parametersStream);
 
-            resolver.create(topicResource, jobId, properties);
+            resolver.create(parentResource, jobId, properties);
             resolver.commit();
 
-            LOG.debug("Persisted job: topic={}, jobName={}, id={}", topic, jobName, jobId);
+            LOG.debug("Persisted job: topic={}, jobName={}, path={}", topic, jobName, jobPath);
             return jobPath;
 
         } catch (LoginException e) {
@@ -136,9 +126,17 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         }
     }
 
+    /**
+     * Builds the date path: year/month/day (e.g., "2024/12/04")
+     */
+    private String buildDatePath() {
+        LocalDate today = LocalDate.now(ZoneId.systemDefault());
+        return String.format("%d/%02d/%02d", today.getYear(), today.getMonthValue(), today.getDayOfMonth());
+    }
+
     @Override
     public void remove(String persistenceId) throws JobPersistenceException {
-        if (!enabled || persistenceId == null) {
+        if (persistenceId == null) {
             return;
         }
 
@@ -160,7 +158,8 @@ public class JcrJobPersistenceService implements JobPersistenceService {
     public List<PersistedJob> loadAll() throws JobPersistenceException {
         List<PersistedJob> jobs = new ArrayList<>();
 
-        if (!enabled) {
+        if (!clusterLeaderService.isLeader()) {
+            LOG.debug("Not the cluster leader, skipping job loading");
             return jobs;
         }
 
@@ -171,19 +170,22 @@ public class JcrJobPersistenceService implements JobPersistenceService {
                 return jobs;
             }
 
-            // Iterate through topic folders
-            for (Resource topicResource : storageResource.getChildren()) {
-                String topic = topicResource.getName();
-                
-                // Iterate through job nodes in each topic
-                for (Resource jobResource : topicResource.getChildren()) {
-                    try {
-                        PersistedJob job = loadJob(topic, jobResource);
-                        if (job != null) {
-                            jobs.add(job);
+            // Traverse: /var/guarded-jobs/{sling-id}/{year}/{month}/{day}/{job-id}
+            for (Resource slingIdResource : storageResource.getChildren()) {
+                for (Resource yearResource : slingIdResource.getChildren()) {
+                    for (Resource monthResource : yearResource.getChildren()) {
+                        for (Resource dayResource : monthResource.getChildren()) {
+                            for (Resource jobResource : dayResource.getChildren()) {
+                                try {
+                                    PersistedJob job = loadJob(jobResource);
+                                    if (job != null) {
+                                        jobs.add(job);
+                                    }
+                                } catch (Exception e) {
+                                    LOG.warn("Failed to load persisted job: {}", jobResource.getPath(), e);
+                                }
+                            }
                         }
-                    } catch (Exception e) {
-                        LOG.warn("Failed to load persisted job: {}", jobResource.getPath(), e);
                     }
                 }
             }
@@ -196,14 +198,15 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         }
     }
 
-    private PersistedJob loadJob(String topic, Resource jobResource) {
+    private PersistedJob loadJob(Resource jobResource) {
         ValueMap properties = jobResource.getValueMap();
         
+        String topic = properties.get(PROP_TOPIC, String.class);
         String token = properties.get(PROP_TOKEN, String.class);
         String jobName = properties.get(PROP_JOB_NAME, String.class);
         Long persistedAt = properties.get(PROP_PERSISTED_AT, Long.class);
         
-        if (token == null || jobName == null) {
+        if (topic == null || token == null || jobName == null) {
             LOG.warn("Invalid persisted job (missing required properties): {}", jobResource.getPath());
             return null;
         }
@@ -214,7 +217,7 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         if (parametersStream != null) {
             try {
                 String json = new String(parametersStream.readAllBytes(), StandardCharsets.UTF_8);
-                parameters = GSON.fromJson(json, MAP_TYPE);
+                parameters = deserializeParameters(json);
             } catch (Exception e) {
                 LOG.warn("Failed to deserialize parameters for job: {}", jobResource.getPath(), e);
             }
@@ -234,6 +237,31 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         Map<String, Object> authInfo = new HashMap<>();
         authInfo.put(ResourceResolverFactory.SUBSERVICE, SERVICE_USER);
         return resolverFactory.getServiceResourceResolver(authInfo);
+    }
+
+    private String serializeParameters(Map<String, Object> parameters) {
+        if (parameters == null) {
+            return "{}";
+        }
+        try {
+            return OBJECT_MAPPER.writeValueAsString(parameters);
+        } catch (JsonProcessingException e) {
+            LOG.warn("Failed to serialize parameters, using empty map", e);
+            return "{}";
+        }
+    }
+
+    private Map<String, Object> deserializeParameters(String json) {
+        if (json == null || json.isEmpty()) {
+            return new HashMap<>();
+        }
+        try {
+            Map<String, Object> result = OBJECT_MAPPER.readValue(json, MAP_TYPE);
+            return result != null ? result : new HashMap<>();
+        } catch (IOException e) {
+            LOG.warn("Failed to deserialize parameters, using empty map", e);
+            return new HashMap<>();
+        }
     }
 
     private void ensureStoragePathExists() {
@@ -272,10 +300,4 @@ public class JcrJobPersistenceService implements JobPersistenceService {
             }
         }
     }
-
-    private String sanitize(String name) {
-        // Remove characters that are invalid in JCR node names
-        return name.replaceAll("[^a-zA-Z0-9_-]", "_");
-    }
 }
-

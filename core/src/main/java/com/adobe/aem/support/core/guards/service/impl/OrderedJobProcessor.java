@@ -1,11 +1,11 @@
 package com.adobe.aem.support.core.guards.service.impl;
 
+import com.adobe.aem.support.core.guards.cluster.ClusterLeaderService;
 import com.adobe.aem.support.core.guards.persistence.JobPersistenceService;
 import com.adobe.aem.support.core.guards.persistence.JobPersistenceService.JobPersistenceException;
 import com.adobe.aem.support.core.guards.persistence.JobPersistenceService.PersistedJob;
 import com.adobe.aem.support.core.guards.service.GuardedJob;
 import com.adobe.aem.support.core.guards.service.JobProcessor;
-import com.adobe.aem.support.core.guards.service.OrderedJobQueue;
 import com.adobe.aem.support.core.guards.token.GuardedOrderTokenService;
 import org.osgi.service.component.annotations.*;
 import org.osgi.service.metatype.annotations.AttributeDefinition;
@@ -14,26 +14,27 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.*;
 
 /**
  * OSGi implementation of {@link JobProcessor} that processes jobs in token order,
  * grouped by topic.
  * 
- * <p>Each topic has its own {@link OrderedJobQueue} and single-threaded executor.
- * Jobs within a topic execute sequentially in token order. Different topics
- * process independently.</p>
+ * <p><b>Distributed Architecture:</b></p>
+ * <ol>
+ *   <li>Any AEM instance can receive job submissions via HTTP</li>
+ *   <li>Jobs are persisted to JCR</li>
+ *   <li><b>Only the cluster leader</b> polls JCR and processes jobs</li>
+ *   <li>Jobs are processed in token order (global ordering across all instances)</li>
+ *   <li>Jobs are deleted from JCR after successful processing</li>
+ * </ol>
  * 
  * <p>A configurable coalesce time allows jobs arriving from different machines
  * to be properly ordered before processing begins.</p>
  * 
  * <p>Jobs that exceed the configured timeout are cancelled to prevent
  * queue bottlenecking and high heap usage.</p>
- * 
- * <p>When persistence is enabled, jobs are stored in JCR and will be recovered
- * on JVM restart.</p>
  */
 @Component(service = JobProcessor.class, immediate = true)
 @Designate(ocd = OrderedJobProcessor.Config.class)
@@ -57,6 +58,12 @@ public class OrderedJobProcessor implements JobProcessor {
             description = "Maximum time a job is allowed to run before being cancelled. Set to 0 to disable timeout."
         )
         long jobTimeoutSeconds() default 30;
+
+        @AttributeDefinition(
+            name = "Job Poll Interval (ms)",
+            description = "How often the leader polls JCR for new jobs."
+        )
+        long jobPollIntervalMs() default 1000;
     }
 
     @Reference
@@ -65,8 +72,14 @@ public class OrderedJobProcessor implements JobProcessor {
     @Reference(cardinality = ReferenceCardinality.OPTIONAL, policyOption = ReferencePolicyOption.GREEDY)
     private volatile JobPersistenceService persistenceService;
 
-    // Map of job name -> GuardedJob for recovery
+    @Reference(cardinality = ReferenceCardinality.OPTIONAL, policyOption = ReferencePolicyOption.GREEDY)
+    private volatile ClusterLeaderService clusterLeaderService;
+
+    // Map of job name -> GuardedJob implementation
     private final Map<String, GuardedJob<?>> registeredJobs = new ConcurrentHashMap<>();
+    
+    // Track jobs currently being processed to avoid re-polling them
+    private final Set<String> processingJobs = ConcurrentHashMap.newKeySet();
 
     @Reference(
         cardinality = ReferenceCardinality.MULTIPLE,
@@ -75,35 +88,40 @@ public class OrderedJobProcessor implements JobProcessor {
     )
     protected void bindGuardedJob(GuardedJob<?> job) {
         registeredJobs.put(job.getName(), job);
-        LOG.debug("Registered job for recovery: {}", job.getName());
+        LOG.debug("Registered job implementation: {}", job.getName());
     }
 
     protected void unbindGuardedJob(GuardedJob<?> job) {
         registeredJobs.remove(job.getName());
-        LOG.debug("Unregistered job: {}", job.getName());
+        LOG.debug("Unregistered job implementation: {}", job.getName());
     }
 
-    private final Map<String, TopicExecutor> topics = new ConcurrentHashMap<>();
+    // Per-topic executors for sequential processing within topics
+    private final Map<String, ExecutorService> topicExecutors = new ConcurrentHashMap<>();
     private ScheduledExecutorService scheduler;
+    private ScheduledFuture<?> jobPollerFuture;
     private long coalesceTimeMs;
     private long jobTimeoutSeconds;
+    private long jobPollIntervalMs;
     private volatile boolean shutdown = false;
+    private volatile long lastJobSeenTime = 0;
 
     @Activate
     protected void activate(Config config) {
         this.coalesceTimeMs = Math.max(0, config.coalesceTimeMs());
         this.jobTimeoutSeconds = Math.max(0, config.jobTimeoutSeconds());
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        this.jobPollIntervalMs = Math.max(100, config.jobPollIntervalMs());
+        this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r);
             t.setDaemon(true);
             t.setName("job-processor-scheduler");
             return t;
         });
-        LOG.info("OrderedJobProcessor activated with coalesceTimeMs={}, jobTimeoutSeconds={}", 
-            coalesceTimeMs, jobTimeoutSeconds);
+        LOG.info("OrderedJobProcessor activated with coalesceTimeMs={}, jobTimeoutSeconds={}, jobPollIntervalMs={}", 
+            coalesceTimeMs, jobTimeoutSeconds, jobPollIntervalMs);
         
-        // Recover persisted jobs
-        recoverPersistedJobs();
+        // Start the job poller (only does work if leader)
+        startJobPoller();
     }
 
     @Deactivate
@@ -111,59 +129,183 @@ public class OrderedJobProcessor implements JobProcessor {
         shutdownNow();
     }
 
-    private void recoverPersistedJobs() {
-        JobPersistenceService persistence = this.persistenceService;
-        if (persistence == null || !persistence.isEnabled()) {
-            LOG.debug("Job persistence is not enabled, skipping recovery");
+    /**
+     * Starts a scheduled task that polls JCR for new jobs.
+     * Only the leader will actually process jobs.
+     */
+    private void startJobPoller() {
+        jobPollerFuture = scheduler.scheduleWithFixedDelay(
+            this::pollAndProcessJobs,
+            jobPollIntervalMs,
+            jobPollIntervalMs,
+            TimeUnit.MILLISECONDS
+        );
+        LOG.debug("Job poller started with interval {}ms", jobPollIntervalMs);
+    }
+
+    /**
+     * Polls JCR for pending jobs and processes them in token order.
+     * Only runs on the leader instance.
+     */
+    private void pollAndProcessJobs() {
+        if (shutdown) {
             return;
+        }
+
+        JobPersistenceService persistence = this.persistenceService;
+        if (persistence == null) {
+            return;
+        }
+
+        ClusterLeaderService leaderService = this.clusterLeaderService;
+        if (leaderService != null && !leaderService.isLeader()) {
+            return; // Not the leader
         }
 
         try {
             List<PersistedJob> persistedJobs = persistence.loadAll();
             if (persistedJobs.isEmpty()) {
-                LOG.debug("No persisted jobs to recover");
                 return;
             }
 
-            LOG.info("Recovering {} persisted jobs...", persistedJobs.size());
-            int recovered = 0;
-            int failed = 0;
+            // Apply coalesce timing - wait if we just saw new jobs
+            long now = System.currentTimeMillis();
+            if (now - lastJobSeenTime < coalesceTimeMs) {
+                LOG.debug("Coalescing - waiting for more jobs");
+                return;
+            }
+            lastJobSeenTime = now;
 
-            for (PersistedJob persistedJob : persistedJobs) {
-                GuardedJob<?> job = registeredJobs.get(persistedJob.getJobName());
-                if (job == null) {
-                    LOG.warn("Cannot recover job '{}' - no registered implementation found. Removing from persistence.",
-                        persistedJob.getJobName());
-                    try {
-                        persistence.remove(persistedJob.getPersistenceId());
-                    } catch (JobPersistenceException e) {
-                        LOG.warn("Failed to remove orphaned job: {}", persistedJob.getPersistenceId(), e);
-                    }
-                    failed++;
-                    continue;
-                }
+            // Create mutable copy and sort by token timestamp for global ordering
+            List<PersistedJob> sortedJobs = new ArrayList<>(persistedJobs);
+            sortedJobs.sort(Comparator.comparingLong(job -> 
+                tokenService.extractTimestamp(job.getToken())));
 
-                try {
-                    submitInternal(
-                        persistedJob.getTopic(),
-                        persistedJob.getToken(),
-                        job,
-                        persistedJob.getParameters(),
-                        persistedJob.getPersistenceId() // Use existing persistence ID
-                    );
-                    recovered++;
-                    LOG.debug("Recovered job: topic={}, jobName={}, id={}", 
-                        persistedJob.getTopic(), persistedJob.getJobName(), persistedJob.getPersistenceId());
-                } catch (Exception e) {
-                    LOG.error("Failed to recover job: {}", persistedJob.getPersistenceId(), e);
-                    failed++;
-                }
+            LOG.debug("Processing {} jobs from JCR", sortedJobs.size());
+
+            // Group by topic for parallel processing across topics
+            Map<String, List<PersistedJob>> jobsByTopic = new LinkedHashMap<>();
+            for (PersistedJob job : sortedJobs) {
+                jobsByTopic.computeIfAbsent(job.getTopic(), k -> new ArrayList<>()).add(job);
             }
 
-            LOG.info("Job recovery complete: {} recovered, {} failed", recovered, failed);
+            // Process each topic's jobs
+            for (Map.Entry<String, List<PersistedJob>> entry : jobsByTopic.entrySet()) {
+                String topic = entry.getKey();
+                List<PersistedJob> topicJobs = entry.getValue();
+                
+                // Process jobs for this topic sequentially in token order
+                processTopicJobs(topic, topicJobs, persistence);
+            }
 
         } catch (JobPersistenceException e) {
-            LOG.error("Failed to load persisted jobs", e);
+            LOG.error("Failed to poll for persisted jobs", e);
+        }
+    }
+
+    /**
+     * Processes jobs for a single topic sequentially in token order.
+     */
+    private void processTopicJobs(String topic, List<PersistedJob> jobs, JobPersistenceService persistence) {
+        ExecutorService topicExecutor = topicExecutors.computeIfAbsent(topic, t -> 
+            Executors.newSingleThreadExecutor(r -> {
+                Thread thread = new Thread(r);
+                thread.setDaemon(true);
+                thread.setName("topic-executor-" + t);
+                return thread;
+            }));
+
+        for (PersistedJob persistedJob : jobs) {
+            // Skip if already being processed
+            if (!processingJobs.add(persistedJob.getPersistenceId())) {
+                continue;
+            }
+
+            GuardedJob<?> jobImpl = registeredJobs.get(persistedJob.getJobName());
+            if (jobImpl == null) {
+                LOG.warn("No implementation found for job '{}'. Removing from persistence.", 
+                    persistedJob.getJobName());
+                removeFromPersistence(persistence, persistedJob.getPersistenceId());
+                processingJobs.remove(persistedJob.getPersistenceId());
+                continue;
+            }
+
+            // Submit for sequential execution within the topic
+            topicExecutor.submit(() -> {
+                try {
+                    executeJob(persistedJob, jobImpl);
+                } finally {
+                    // Remove from JCR after execution (success or failure)
+                    removeFromPersistence(persistence, persistedJob.getPersistenceId());
+                    processingJobs.remove(persistedJob.getPersistenceId());
+                }
+            });
+        }
+    }
+
+    /**
+     * Executes a single job with timeout handling.
+     */
+    private void executeJob(PersistedJob persistedJob, GuardedJob<?> jobImpl) {
+        String jobName = persistedJob.getJobName();
+        String topic = persistedJob.getTopic();
+        
+        LOG.debug("Executing job: topic={}, name={}, id={}", 
+            topic, jobName, persistedJob.getPersistenceId());
+
+        if (jobTimeoutSeconds <= 0) {
+            // No timeout, execute directly
+            try {
+                jobImpl.execute(persistedJob.getParameters());
+                LOG.debug("Job completed: {}", persistedJob.getPersistenceId());
+            } catch (Exception e) {
+                LOG.error("Job '{}' in topic '{}' failed: {}", jobName, topic, e.getMessage(), e);
+            }
+            return;
+        }
+
+        // Execute with timeout
+        ExecutorService jobExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r);
+            t.setDaemon(true);
+            t.setName("job-runner-" + jobName);
+            return t;
+        });
+
+        Future<?> jobFuture = jobExecutor.submit(() -> {
+            try {
+                jobImpl.execute(persistedJob.getParameters());
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        try {
+            jobFuture.get(jobTimeoutSeconds, TimeUnit.SECONDS);
+            LOG.debug("Job completed: {}", persistedJob.getPersistenceId());
+        } catch (TimeoutException e) {
+            LOG.warn("Job '{}' in topic '{}' cancelled after {} seconds (timeout). " +
+                     "This may indicate a stuck job causing queue bottlenecking.",
+                     jobName, topic, jobTimeoutSeconds);
+            jobFuture.cancel(true);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.warn("Job '{}' in topic '{}' was interrupted", jobName, topic);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            String errorMessage = cause != null ? cause.getMessage() : e.getMessage();
+            LOG.error("Job '{}' in topic '{}' failed: {}", jobName, topic, errorMessage);
+        } finally {
+            jobExecutor.shutdownNow();
+        }
+    }
+
+    private void removeFromPersistence(JobPersistenceService persistence, String persistenceId) {
+        try {
+            persistence.remove(persistenceId);
+            LOG.debug("Removed job from JCR: {}", persistenceId);
+        } catch (JobPersistenceException e) {
+            LOG.warn("Failed to remove job from JCR: {}", persistenceId, e);
         }
     }
 
@@ -177,28 +319,33 @@ public class OrderedJobProcessor implements JobProcessor {
             return future;
         }
 
-        // Persist the job if persistence is enabled
-        String persistenceId = null;
         JobPersistenceService persistence = this.persistenceService;
-        if (persistence != null && persistence.isEnabled()) {
-            try {
-                persistenceId = persistence.persist(topic, token, job.getName(), parameters);
-                LOG.debug("Persisted job: topic={}, jobName={}, id={}", topic, job.getName(), persistenceId);
-            } catch (JobPersistenceException e) {
-                LOG.warn("Failed to persist job (will continue without persistence): topic={}, jobName={}", 
-                    topic, job.getName(), e);
-            }
+        if (persistence == null) {
+            CompletableFuture<T> future = new CompletableFuture<>();
+            future.completeExceptionally(new IllegalStateException("Persistence service not available"));
+            return future;
         }
 
-        return submitInternal(topic, token, job, parameters, persistenceId);
-    }
-
-    @SuppressWarnings("unchecked")
-    private <T> CompletableFuture<T> submitInternal(String topic, String token, GuardedJob<?> job, 
-            Map<String, Object> parameters, String persistenceId) {
-        TopicExecutor executor = topics.computeIfAbsent(topic, 
-            t -> new TopicExecutor(t, tokenService, scheduler, coalesceTimeMs, jobTimeoutSeconds, persistenceService));
-        return executor.submit(token, (GuardedJob<T>) job, parameters, persistenceId);
+        try {
+            String persistenceId = persistence.persist(topic, token, job.getName(), parameters);
+            LOG.info("Job submitted and persisted: topic={}, jobName={}, id={}", 
+                topic, job.getName(), persistenceId);
+            
+            // Update last seen time to trigger coalesce
+            lastJobSeenTime = System.currentTimeMillis();
+            
+            // Return completed future - actual execution happens via poller on leader
+            // Result is not available since execution happens asynchronously
+            CompletableFuture<T> future = new CompletableFuture<>();
+            future.complete(null);
+            return future;
+            
+        } catch (JobPersistenceException e) {
+            LOG.error("Failed to persist job: topic={}, jobName={}", topic, job.getName(), e);
+            CompletableFuture<T> future = new CompletableFuture<>();
+            future.completeExceptionally(e);
+            return future;
+        }
     }
 
     private void validateSubmission(String topic, String token, GuardedJob<?> job) {
@@ -215,21 +362,42 @@ public class OrderedJobProcessor implements JobProcessor {
 
     @Override
     public int getPendingCount(String topic) {
-        TopicExecutor executor = topics.get(topic);
-        return executor != null ? executor.getPendingCount() : 0;
+        // Count jobs in JCR for this topic
+        JobPersistenceService persistence = this.persistenceService;
+        if (persistence == null) {
+            return 0;
+        }
+        try {
+            return (int) persistence.loadAll().stream()
+                .filter(job -> topic.equals(job.getTopic()))
+                .count();
+        } catch (JobPersistenceException e) {
+            LOG.warn("Failed to count pending jobs for topic: {}", topic, e);
+            return 0;
+        }
     }
 
     @Override
     public int getTotalPendingCount() {
-        return topics.values().stream()
-            .mapToInt(TopicExecutor::getPendingCount)
-            .sum();
+        JobPersistenceService persistence = this.persistenceService;
+        if (persistence == null) {
+            return 0;
+        }
+        try {
+            return persistence.loadAll().size();
+        } catch (JobPersistenceException e) {
+            LOG.warn("Failed to count total pending jobs", e);
+            return 0;
+        }
     }
 
     @Override
     public void shutdown() {
         shutdown = true;
-        topics.values().forEach(TopicExecutor::shutdown);
+        if (jobPollerFuture != null) {
+            jobPollerFuture.cancel(false);
+        }
+        topicExecutors.values().forEach(ExecutorService::shutdown);
         if (scheduler != null) {
             scheduler.shutdown();
         }
@@ -238,7 +406,10 @@ public class OrderedJobProcessor implements JobProcessor {
     @Override
     public void shutdownNow() {
         shutdown = true;
-        topics.values().forEach(TopicExecutor::shutdownNow);
+        if (jobPollerFuture != null) {
+            jobPollerFuture.cancel(true);
+        }
+        topicExecutors.values().forEach(ExecutorService::shutdownNow);
         if (scheduler != null) {
             scheduler.shutdownNow();
         }
@@ -247,174 +418,5 @@ public class OrderedJobProcessor implements JobProcessor {
     @Override
     public boolean isShutdown() {
         return shutdown;
-    }
-
-    /**
-     * Executor for a single topic - runs jobs one at a time in token order.
-     * Uses coalesce timing to allow jobs from different sources to be properly ordered.
-     */
-    private static class TopicExecutor {
-        private static final Logger LOG = LoggerFactory.getLogger(TopicExecutor.class);
-
-        private final String topic;
-        private final OrderedJobQueue queue;
-        private final ExecutorService executor;
-        private final ScheduledExecutorService scheduler;
-        private final long coalesceTimeMs;
-        private final long jobTimeoutSeconds;
-        private final JobPersistenceService persistenceService;
-        private volatile long lastSubmitTime;
-        private volatile boolean processing;
-        private volatile ScheduledFuture<?> scheduledStart;
-
-        TopicExecutor(String topic, GuardedOrderTokenService tokenService, ScheduledExecutorService scheduler, 
-                      long coalesceTimeMs, long jobTimeoutSeconds, JobPersistenceService persistenceService) {
-            this.topic = topic;
-            this.queue = new OrderedJobQueue(tokenService);
-            this.executor = Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r);
-                t.setDaemon(true);
-                t.setName("topic-executor-" + topic);
-                return t;
-            });
-            this.scheduler = scheduler;
-            this.coalesceTimeMs = coalesceTimeMs;
-            this.jobTimeoutSeconds = jobTimeoutSeconds;
-            this.persistenceService = persistenceService;
-            this.lastSubmitTime = 0;
-            this.processing = false;
-        }
-
-        <T> CompletableFuture<T> submit(String token, GuardedJob<T> job, Map<String, Object> parameters, 
-                String persistenceId) {
-            CompletableFuture<T> future = queue.add(token, job, parameters, persistenceId);
-            lastSubmitTime = System.currentTimeMillis();
-            scheduleProcessing();
-            return future;
-        }
-
-        private synchronized void scheduleProcessing() {
-            if (processing) {
-                return;
-            }
-            
-            if (scheduledStart != null && !scheduledStart.isDone()) {
-                scheduledStart.cancel(false);
-            }
-            
-            scheduledStart = scheduler.schedule(this::startIfReady, coalesceTimeMs, TimeUnit.MILLISECONDS);
-        }
-
-        private synchronized void startIfReady() {
-            if (processing || queue.isEmpty()) {
-                return;
-            }
-            
-            long elapsed = System.currentTimeMillis() - lastSubmitTime;
-            if (elapsed < coalesceTimeMs) {
-                scheduledStart = scheduler.schedule(this::startIfReady, coalesceTimeMs - elapsed, TimeUnit.MILLISECONDS);
-                return;
-            }
-            
-            processing = true;
-            executor.submit(this::processAll);
-        }
-
-        private void processAll() {
-            OrderedJobQueue.JobEntry<?> entry;
-            while ((entry = queue.poll()) != null) {
-                executeWithTimeout(entry);
-                
-                // Remove from persistence after execution (success or failure)
-                removeFromPersistence(entry.getPersistenceId());
-            }
-            
-            synchronized (this) {
-                processing = false;
-                if (!queue.isEmpty()) {
-                    scheduleProcessing();
-                }
-            }
-        }
-
-        private void removeFromPersistence(String persistenceId) {
-            if (persistenceId == null || persistenceService == null) {
-                return;
-            }
-            
-            try {
-                persistenceService.remove(persistenceId);
-                LOG.debug("Removed completed job from persistence: {}", persistenceId);
-            } catch (JobPersistenceException e) {
-                LOG.warn("Failed to remove job from persistence: {}", persistenceId, e);
-            }
-        }
-
-        private void executeWithTimeout(OrderedJobQueue.JobEntry<?> entry) {
-            if (jobTimeoutSeconds <= 0) {
-                // Timeout disabled, execute directly
-                entry.execute();
-                return;
-            }
-
-            String jobName = entry.getJob().getName();
-            long startTime = System.currentTimeMillis();
-            
-            // Create a separate thread for job execution so we can interrupt it
-            ExecutorService jobExecutor = Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r);
-                t.setDaemon(true);
-                t.setName("job-runner-" + jobName);
-                return t;
-            });
-
-            Future<?> jobFuture = jobExecutor.submit(entry::execute);
-
-            try {
-                jobFuture.get(jobTimeoutSeconds, TimeUnit.SECONDS);
-            } catch (TimeoutException e) {
-                long elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000;
-                LOG.warn("Job '{}' in topic '{}' cancelled after {} seconds (timeout: {}s). " +
-                         "This may indicate a long-running or stuck job that could cause queue bottlenecking and high heap usage.",
-                         jobName, topic, elapsedSeconds, jobTimeoutSeconds);
-                
-                // Complete the future exceptionally FIRST, before cancelling
-                // This ensures the TimeoutException is set before any InterruptedException from cancellation
-                boolean completed = entry.getFuture().completeExceptionally(
-                    new TimeoutException("Job '" + jobName + "' cancelled after exceeding timeout of " + 
-                                         jobTimeoutSeconds + " seconds"));
-                
-                if (completed) {
-                    LOG.debug("Job '{}' future completed with TimeoutException", jobName);
-                }
-                
-                // Now cancel the job and interrupt the thread
-                jobFuture.cancel(true);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                LOG.warn("Job '{}' in topic '{}' was interrupted", jobName, topic);
-                entry.getFuture().completeExceptionally(e);
-            } catch (ExecutionException e) {
-                // Job threw an exception - this is already handled by entry.execute()
-                // but we log it here for visibility
-                Throwable cause = e.getCause();
-                String errorMessage = cause != null ? cause.toString() : e.toString();
-                LOG.debug("Job '{}' in topic '{}' threw an exception: {}", jobName, topic, errorMessage);
-            } finally {
-                jobExecutor.shutdownNow();
-            }
-        }
-
-        int getPendingCount() {
-            return queue.size();
-        }
-
-        void shutdown() {
-            executor.shutdown();
-        }
-
-        void shutdownNow() {
-            executor.shutdownNow();
-        }
     }
 }
