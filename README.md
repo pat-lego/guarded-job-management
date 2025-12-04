@@ -8,14 +8,22 @@ A distributed job processing system for Adobe Experience Manager (AEM) that guar
 
 ## 🎯 The Problem
 
-In distributed systems, you often need to process jobs **in the order they were initiated**, not the order they arrived at the server. Network delays can cause jobs to arrive out of order:
+In distributed systems, you often need to process jobs **sequentially within a topic** to maintain consistency. When multiple AEM instances receive job requests, you need a guarantee that:
+
+1. Each job is assigned a **unique, ordered token** when received
+2. Jobs within a topic are **processed sequentially** in token order
+3. No two jobs in the same topic run concurrently
 
 ```
-Machine A creates Job 1 at 10:00:00.001 ──────────────[delayed]──────────────▶ Arrives 10:00:00.150
-Machine B creates Job 2 at 10:00:00.050 ───▶ Arrives 10:00:00.055
+Instance A receives Job 1 ──▶ Token: 10:00:00.055 ──┐
+Instance B receives Job 2 ──▶ Token: 10:00:00.150 ──┼──▶ Topic: "publishing"
+Instance A receives Job 3 ──▶ Token: 10:00:00.200 ──┘         │
+                                                              ▼
+                                                    Processed: Job 1 → Job 2 → Job 3
+                                                    (sequential, in token order)S
 ```
 
-Without ordering guarantees, Job 2 would be processed before Job 1, even though Job 1 was created first. This system solves that problem.
+This system ensures **ordered, sequential execution** within each topic, even when jobs are submitted from different machines.
 
 ## 🏗️ Architecture
 
@@ -58,8 +66,8 @@ Without ordering guarantees, Job 2 would be processed before Job 1, even though 
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                            Job Implementations                                │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐               │
-│  │    EchoJob      │  │  EmptyGuardedJob│  │  Your Custom    │               │
-│  │   "echo"        │  │    "empty"      │  │     Jobs...     │               │
+│  │    EchoJob      │  │  ReplicationJob │  │  Your Custom    │               │
+│  │   "echo"        │  │   "replicate"   │  │     Jobs...     │               │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘               │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -111,21 +119,23 @@ Topic: "asset-processing"     Topic: "page-publishing"
 
 ### Coalesce Timing
 
-To handle network delays, the processor **waits briefly** after receiving a job before starting to process:
+To batch jobs that arrive in quick succession, the processor **waits briefly** after receiving a job before starting to process. This allows jobs from different instances to be grouped and sorted together:
 
 ```
 Time ─────────────────────────────────────────────────────▶
 
-  Job 1 arrives ──┐
-                  │    ┌── Coalesce window (50ms default)
-  Job 3 arrives ──┼────┤
-                  │    │
-  Job 2 arrives ──┘    │
-                       │
-                       └──▶ Processing starts
-                            Jobs sorted: 1, 2, 3
-                            Executed: 1 → 2 → 3 ✓
+  Job A arrives (token: 001) ──┐
+                               │    ┌── Coalesce window (50ms default)
+  Job C arrives (token: 003) ──┼────┤
+                               │    │
+  Job B arrives (token: 002) ──┘    │
+                                    │
+                                    └──▶ Processing starts
+                                         Jobs sorted by token: A, B, C
+                                         Executed: A → B → C ✓
 ```
+
+Jobs are assigned tokens when received by the server (nanosecond precision). The coalesce window groups jobs that arrive close together, then sorts them by token before processing.
 
 ## 📦 Components
 
@@ -171,6 +181,115 @@ Orchestrates job submission and ordered execution:
 - **Poll**: Leader instance polls JCR at configured intervals
 - **Execute**: Processes jobs sequentially per topic, with configurable timeout
 - **Cleanup**: Removes jobs from JCR after execution
+
+## 📋 Built-in Jobs
+
+### ReplicationGuardedJob
+
+A production-ready job for **ordered content replication**. Ensures pages are replicated in the exact order they were submitted, even across multiple AEM instances.
+
+**Job Name:** `replicate`
+
+**Key Features:**
+- **Synchronous replication** — Uses `setSynchronous(true)` so the job blocks until the content is delivered to the publisher
+- **User session authentication** — Uses the submitting user's session for permission checks (not a service user)
+- **Batched processing** — Replicates up to 10 paths per call to balance efficiency with overhead
+- **Multiple action types** — Supports ACTIVATE, DEACTIVATE, and DELETE
+
+**Why Synchronous?**
+
+When `setSynchronous(true)` is set, the `Replicator.replicate()` call blocks until the transport handler completes delivery. This guarantees:
+1. The content package has been sent to the target
+2. Any replication errors are thrown immediately
+3. The job only completes when replication is done
+
+Without synchronous mode, replication is queued and processed asynchronously — you wouldn't know if it succeeded.
+
+**Parameters:**
+
+| Parameter | Required | Type | Description |
+|-----------|----------|------|-------------|
+| `paths` | Yes | String[], List, or comma-separated String | Paths to replicate |
+| `action` | No | String | `ACTIVATE` (default), `DEACTIVATE`, or `DELETE` |
+
+> **Note:** The `_resourceResolver` parameter is automatically injected by the `JobSubmitServlet`. If the job is executed without a ResourceResolver (e.g., from a non-HTTP context), it will fail with a clear error message.
+
+**Example: Activate Pages**
+
+```bash
+curl -X POST http://localhost:4502/bin/guards/job.submit.json \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topic": "publishing",
+    "jobName": "replicate",
+    "parameters": {
+      "paths": ["/content/mysite/page1", "/content/mysite/page2"],
+      "action": "ACTIVATE"
+    }
+  }'
+```
+
+**Example: Deactivate Pages**
+
+```bash
+curl -X POST http://localhost:4502/bin/guards/job.submit.json \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topic": "unpublishing",
+    "jobName": "replicate",
+    "parameters": {
+      "paths": "/content/mysite/old-page",
+      "action": "DEACTIVATE"
+    }
+  }'
+```
+
+**Batch Processing:**
+
+Paths are replicated in batches of 10 to optimize performance:
+
+```
+25 paths submitted
+  → Batch 1: paths[0-9]   (10 paths)
+  → Batch 2: paths[10-19] (10 paths)
+  → Batch 3: paths[20-24] (5 paths)
+```
+
+This avoids the overhead of replicating one path at a time while keeping each batch small enough to avoid memory issues.
+
+**Error Handling:**
+
+- If any path fails to replicate, the entire job fails with a `RuntimeException`
+- The error message includes the original `ReplicationException` details
+- Failed jobs are still removed from JCR (the processor handles cleanup)
+
+**Security:**
+
+The job uses the **user's session** from the HTTP request, not a service user. This means:
+- Replication respects the user's permissions (`crx:replicate` privilege)
+- Users can only replicate content they have access to
+- Audit logs show the actual user who triggered replication
+
+### EchoJob
+
+A simple test job that echoes a message. Useful for testing the job system.
+
+**Job Name:** `echo`
+
+```bash
+curl -X POST http://localhost:4502/bin/guards/job.submit.json \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "test", "jobName": "echo", "parameters": {"message": "Hello!"}}'
+```
+
+### EmptyGuardedJob
+
+A minimal no-op job. Useful as a template for creating new jobs.
+
+**Job Name:** `empty`
 
 ## 🚀 HTTP API
 
@@ -273,27 +392,30 @@ Configure the coalesce timing and job timeout:
 
 #### Understanding `coalesceTimeMs`
 
-This setting controls how long the processor waits after receiving a job before starting to process the queue. This is **critical for distributed ordering**.
+This setting controls how long the processor waits after receiving a job before starting to process the queue. This helps **batch jobs for efficient processing**.
 
 **Why it matters:**
 ```
-Machine A: Job created at T=0ms  ──[network delay 80ms]──▶  Arrives at T=80ms
-Machine B: Job created at T=50ms ──[fast network]────────▶  Arrives at T=55ms
+T=0ms:   Job A received ──▶ Token assigned
+T=55ms:  Job B received ──▶ Token assigned
+T=80ms:  Job C received ──▶ Token assigned
+         │
+         └──▶ Coalesce window (100ms) ──▶ All 3 jobs processed together
 ```
 
-Without coalescing, Job B would process first (arrived first), even though Job A was created earlier. The coalesce window gives time for delayed jobs to arrive.
+The coalesce window groups jobs that arrive in quick succession, allowing them to be sorted by token and processed in a single batch rather than one at a time.
 
 **Tuning guidelines:**
 
 | Value | Use Case |
 |-------|----------|
-| `0` | Single machine only, no network delays expected |
-| `20-50` | Local network, low latency between machines |
-| `50-100` | **Recommended default** — handles typical network variability |
-| `100-500` | High-latency networks, geographically distributed systems |
-| `500+` | Very unreliable networks (use with caution — adds latency to all jobs) |
+| `0` | Immediate processing, no batching |
+| `20-50` | Low-latency environments, quick job starts |
+| `50-100` | **Recommended default** — balances batching with responsiveness |
+| `100-500` | High-throughput scenarios where batching improves efficiency |
+| `500+` | Bulk job submission scenarios (use with caution — adds latency) |
 
-**Trade-off:** Higher values = better ordering accuracy but slower job start time.
+**Trade-off:** Higher values = better batching efficiency but slower job start time.
 
 #### Understanding `jobTimeoutSeconds`
 
@@ -752,7 +874,8 @@ guarded-job-management/
 │       │   └── JobListServlet.java              # GET .list
 │       └── jobs/
 │           ├── EchoJob.java                     # Example job
-│           └── EmptyGuardedJob.java             # Minimal example
+│           ├── EmptyGuardedJob.java             # Minimal example
+│           └── ReplicationGuardedJob.java       # Ordered content replication
 ├── ui.config/
 │   └── src/main/content/jcr_root/
 │       ├── apps/.../osgiconfig/
@@ -779,10 +902,10 @@ guarded-job-management/
 
 ## 📈 Performance
 
-- **Per-topic throughput**: Sequential by design (ordering guarantee)
-- **Cross-topic throughput**: Fully parallel (independent executors)
+- **Per-topic throughput**: Sequential by design (ordering guarantee within topic)
+- **Cross-topic throughput**: Fully parallel (independent executors per topic)
 - **Memory**: O(pending jobs) per topic
-- **Coalesce tradeoff**: Higher values = better ordering accuracy, lower values = faster processing
+- **Coalesce tradeoff**: Higher values = better batching, lower values = faster job start
 
 ## 🛠️ Building & Testing
 
@@ -833,6 +956,7 @@ The project includes unit tests for:
 - `GuardedOrderToken` — Token generation, validation, and ordering
 - `OrderedJobQueue` — Thread-safe queue operations
 - `OrderedJobProcessor` — Job submission and ordered execution
+- `ReplicationGuardedJob` — Path parsing, batching, action types, synchronous replication
 
 ### Integration Testing
 
