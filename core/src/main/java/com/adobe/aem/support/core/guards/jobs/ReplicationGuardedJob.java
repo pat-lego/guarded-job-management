@@ -102,10 +102,13 @@ public class ReplicationGuardedJob implements GuardedJob<ReplicationGuardedJob.R
         options.setSynchronous(true);
 
         try {
-            // Trigger synchronous replication for all paths
-            for (String path : paths) {
-                LOG.debug("Replicating path: {}", path);
-                replicator.replicate(session, actionType, path, options);
+            // Replicate in batches of up to 10 paths (more efficient than one-by-one, but avoids overhead of too many at once)
+            int batchSize = 10;
+            for (int i = 0; i < paths.length; i += batchSize) {
+                int end = Math.min(i + batchSize, paths.length);
+                String[] batch = Arrays.copyOfRange(paths, i, end);
+                LOG.debug("Replicating batch of {} paths: {}", batch.length, Arrays.toString(batch));
+                replicator.replicate(session, actionType, batch, options);
             }
 
             LOG.info("Replication completed: requestId={}, paths={}", requestId, Arrays.toString(paths));
