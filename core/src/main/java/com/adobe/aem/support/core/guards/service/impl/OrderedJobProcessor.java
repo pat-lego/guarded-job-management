@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * OSGi implementation of {@link JobProcessor} that processes jobs in token order,
@@ -96,8 +97,73 @@ public class OrderedJobProcessor implements JobProcessor {
         LOG.debug("Unregistered job implementation: {}", job.getName());
     }
 
-    // Per-topic executors for sequential processing within topics
-    private final Map<String, ExecutorService> topicExecutors = new ConcurrentHashMap<>();
+    // Per-topic priority executors for sequential processing in timestamp order
+    private final Map<String, PriorityExecutor> topicExecutors = new ConcurrentHashMap<>();
+    
+    /**
+     * A single-threaded executor that processes jobs in priority order (by timestamp).
+     * This ensures that even if a job with an earlier timestamp arrives late,
+     * it will still be processed before jobs with later timestamps.
+     */
+    private static class PriorityExecutor {
+        private final ThreadPoolExecutor executor;
+        
+        PriorityExecutor(String topic) {
+            // Comparator: first by timestamp, then by sequence number (for same-timestamp jobs)
+            Comparator<Runnable> comparator = Comparator
+                .comparingLong((Runnable r) -> ((PrioritizedJobRunnable) r).timestamp)
+                .thenComparingLong(r -> ((PrioritizedJobRunnable) r).sequenceNumber);
+            
+            PriorityBlockingQueue<Runnable> queue = new PriorityBlockingQueue<>(100, comparator);
+            this.executor = new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS,
+                queue,
+                r -> {
+                    Thread t = new Thread(r);
+                    t.setDaemon(true);
+                    t.setName("topic-executor-" + topic);
+                    return t;
+                }
+            );
+        }
+        
+        void submit(PrioritizedJobRunnable job) {
+            executor.execute(job);
+        }
+        
+        void shutdown() {
+            executor.shutdown();
+        }
+        
+        void shutdownNow() {
+            executor.shutdownNow();
+        }
+    }
+    
+    /**
+     * A Runnable wrapper that carries the job's timestamp for priority ordering.
+     * Jobs with lower timestamps (earlier) have higher priority.
+     * The sequence number serves as a tie-breaker for jobs with identical timestamps.
+     */
+    private static class PrioritizedJobRunnable implements Runnable {
+        private final long timestamp;
+        private final long sequenceNumber;
+        private final Runnable task;
+        
+        // Tie-breaker sequence for jobs with the same timestamp (preserves insertion order)
+        private static final AtomicLong sequencer = new AtomicLong(0);
+        
+        PrioritizedJobRunnable(long timestamp, Runnable task) {
+            this.timestamp = timestamp;
+            this.task = task;
+            this.sequenceNumber = sequencer.incrementAndGet();
+        }
+        
+        @Override
+        public void run() {
+            task.run();
+        }
+    }
     private ScheduledExecutorService scheduler;
     private ScheduledFuture<?> jobPollerFuture;
     private long coalesceTimeMs;
@@ -202,15 +268,13 @@ public class OrderedJobProcessor implements JobProcessor {
 
     /**
      * Processes jobs for a single topic sequentially in token order.
+     * 
+     * <p>Uses a priority queue executor to ensure jobs are always processed
+     * in timestamp order, even if a job with an earlier timestamp arrives late
+     * (e.g., due to network delays).</p>
      */
     private void processTopicJobs(String topic, List<PersistedJob> jobs, JobPersistenceService persistence) {
-        ExecutorService topicExecutor = topicExecutors.computeIfAbsent(topic, t -> 
-            Executors.newSingleThreadExecutor(r -> {
-                Thread thread = new Thread(r);
-                thread.setDaemon(true);
-                thread.setName("topic-executor-" + t);
-                return thread;
-            }));
+        PriorityExecutor topicExecutor = topicExecutors.computeIfAbsent(topic, PriorityExecutor::new);
 
         for (PersistedJob persistedJob : jobs) {
             // Skip if already being processed
@@ -227,8 +291,11 @@ public class OrderedJobProcessor implements JobProcessor {
                 continue;
             }
 
-            // Submit for sequential execution within the topic
-            topicExecutor.submit(() -> {
+            // Extract timestamp from token for priority ordering
+            long timestamp = tokenService.extractTimestamp(persistedJob.getToken());
+            
+            // Submit with priority based on timestamp (lower = higher priority = earlier execution)
+            Runnable task = () -> {
                 try {
                     executeJob(persistedJob, jobImpl);
                 } finally {
@@ -236,7 +303,11 @@ public class OrderedJobProcessor implements JobProcessor {
                     removeFromPersistence(persistence, persistedJob.getPersistenceId());
                     processingJobs.remove(persistedJob.getPersistenceId());
                 }
-            });
+            };
+            
+            topicExecutor.submit(new PrioritizedJobRunnable(timestamp, task));
+            LOG.debug("Queued job for execution: topic={}, timestamp={}, id={}", 
+                topic, timestamp, persistedJob.getPersistenceId());
         }
     }
 
@@ -394,7 +465,7 @@ public class OrderedJobProcessor implements JobProcessor {
         if (jobPollerFuture != null) {
             jobPollerFuture.cancel(false);
         }
-        topicExecutors.values().forEach(ExecutorService::shutdown);
+        topicExecutors.values().forEach(PriorityExecutor::shutdown);
         if (scheduler != null) {
             scheduler.shutdown();
         }
@@ -406,7 +477,7 @@ public class OrderedJobProcessor implements JobProcessor {
         if (jobPollerFuture != null) {
             jobPollerFuture.cancel(true);
         }
-        topicExecutors.values().forEach(ExecutorService::shutdownNow);
+        topicExecutors.values().forEach(PriorityExecutor::shutdownNow);
         if (scheduler != null) {
             scheduler.shutdownNow();
         }
