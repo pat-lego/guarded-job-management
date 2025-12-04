@@ -64,6 +64,7 @@ public class JcrJobPersistenceService implements JobPersistenceService {
     private static final String PROP_TOKEN_TIMESTAMP = "gjm:tokenTimestamp";
     private static final String PROP_TOKEN_SIGNATURE = "gjm:tokenSignature";
     private static final String PROP_JOB_NAME = "gjm:jobName";
+    private static final String PROP_SUBMITTED_BY = "gjm:submittedBy";
     private static final String PROP_PERSISTED_AT = "persistedAt";
     private static final String PROP_PARAMETERS = "parameters";
     private static final String NT_UNSTRUCTURED = "nt:unstructured";
@@ -95,7 +96,7 @@ public class JcrJobPersistenceService implements JobPersistenceService {
     }
 
     @Override
-    public String persist(String topic, String token, String jobName, Map<String, Object> parameters) 
+    public String persist(String topic, String token, String jobName, String submittedBy, Map<String, Object> parameters) 
             throws JobPersistenceException {
 
         String slingId = clusterLeaderService.getSlingId();
@@ -132,6 +133,7 @@ public class JcrJobPersistenceService implements JobPersistenceService {
             properties.put(PROP_TOKEN_TIMESTAMP, tokenTimestamp);
             properties.put(PROP_TOKEN_SIGNATURE, tokenSignature);
             properties.put(PROP_JOB_NAME, jobName);
+            properties.put(PROP_SUBMITTED_BY, submittedBy != null ? submittedBy : "unknown");
             properties.put(PROP_PERSISTED_AT, System.currentTimeMillis());
             
             // Store parameters as JSON blob
@@ -143,8 +145,8 @@ public class JcrJobPersistenceService implements JobPersistenceService {
             resolver.create(parentResource, jobId, properties);
             resolver.commit();
 
-            LOG.debug("Persisted job: topic={}, jobName={}, timestamp={}, path={}", 
-                topic, jobName, tokenTimestamp, jobPath);
+            LOG.debug("Persisted job: topic={}, jobName={}, submittedBy={}, timestamp={}, path={}", 
+                topic, jobName, submittedBy, tokenTimestamp, jobPath);
             return jobPath;
 
         } catch (LoginException e) {
@@ -212,6 +214,130 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         } catch (LoginException e) {
             throw new JobPersistenceException("Failed to get service resolver", e);
         }
+    }
+
+    @Override
+    public List<PersistedJob> loadByTopic(String topic, int limit) throws JobPersistenceException {
+        List<PersistedJob> jobs = new ArrayList<>();
+
+        if (topic == null || topic.trim().isEmpty()) {
+            return jobs;
+        }
+
+        int effectiveLimit = Math.min(limit, MAX_JOBS_PER_QUERY);
+        if (effectiveLimit <= 0) {
+            effectiveLimit = MAX_JOBS_PER_QUERY;
+        }
+
+        try (ResourceResolver resolver = getServiceResolver()) {
+            Resource storageResource = resolver.getResource(STORAGE_PATH);
+            if (storageResource == null) {
+                LOG.debug("Storage path does not exist: {}", STORAGE_PATH);
+                return jobs;
+            }
+
+            // Try JCR query first (efficient for production with proper indexing)
+            jobs = loadJobsByTopicViaQuery(resolver, topic, effectiveLimit);
+            
+            // Fallback to traversal if query returned no results
+            if (jobs.isEmpty()) {
+                jobs = loadJobsByTopicViaTraversal(storageResource, topic, effectiveLimit);
+            }
+            
+            return jobs;
+
+        } catch (LoginException e) {
+            throw new JobPersistenceException("Failed to get service resolver", e);
+        }
+    }
+
+    /**
+     * Loads jobs for a specific topic using JCR SQL2 query.
+     */
+    private List<PersistedJob> loadJobsByTopicViaQuery(ResourceResolver resolver, String topic, int limit) {
+        List<PersistedJob> jobs = new ArrayList<>();
+        
+        try {
+            // Query by mixin type and topic, ordered by timestamp
+            String query = String.format(
+                "SELECT * FROM [%s] AS job " +
+                "WHERE ISDESCENDANTNODE(job, '%s') " +
+                "AND job.[%s] = '%s' " +
+                "ORDER BY job.[%s] ASC " +
+                "OPTION(LIMIT %d)",
+                MIXIN_GUARDED_JOB, STORAGE_PATH, PROP_TOPIC, topic.replace("'", "''"), 
+                PROP_TOKEN_TIMESTAMP, limit
+            );
+
+            Iterator<Resource> results = resolver.findResources(query, Query.JCR_SQL2);
+            
+            while (results.hasNext()) {
+                Resource jobResource = results.next();
+                try {
+                    PersistedJob job = loadJob(jobResource);
+                    if (job != null) {
+                        jobs.add(job);
+                    }
+                } catch (Exception e) {
+                    LOG.warn("Failed to load persisted job: {}", jobResource.getPath(), e);
+                }
+            }
+
+            if (!jobs.isEmpty()) {
+                LOG.debug("Loaded {} jobs for topic '{}' via query (limit: {})", jobs.size(), topic, limit);
+            }
+        } catch (Exception e) {
+            LOG.debug("Query failed for topic '{}', will use traversal fallback: {}", topic, e.getMessage());
+        }
+        
+        return jobs;
+    }
+
+    /**
+     * Loads jobs for a specific topic via tree traversal - fallback for environments without query support.
+     */
+    private List<PersistedJob> loadJobsByTopicViaTraversal(Resource storageResource, String topic, int limit) {
+        List<PersistedJob> jobs = new ArrayList<>();
+        
+        // Traverse: /var/guarded-jobs/{sling-id}/{year}/{month}/{day}/{job-id}
+        for (Resource slingIdResource : storageResource.getChildren()) {
+            for (Resource yearResource : slingIdResource.getChildren()) {
+                for (Resource monthResource : yearResource.getChildren()) {
+                    for (Resource dayResource : monthResource.getChildren()) {
+                        for (Resource jobResource : dayResource.getChildren()) {
+                            try {
+                                PersistedJob job = loadJob(jobResource);
+                                if (job != null && topic.equals(job.getTopic())) {
+                                    jobs.add(job);
+                                }
+                            } catch (Exception e) {
+                                LOG.warn("Failed to load persisted job: {}", jobResource.getPath(), e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by timestamp and limit
+        jobs.sort(Comparator.comparingLong(job -> {
+            try {
+                String[] parts = job.getToken().split("\\.", 2);
+                return Long.parseLong(parts[0]);
+            } catch (Exception e) {
+                return 0L;
+            }
+        }));
+        
+        if (jobs.size() > limit) {
+            jobs = jobs.subList(0, limit);
+        }
+
+        if (!jobs.isEmpty()) {
+            LOG.debug("Loaded {} jobs for topic '{}' via traversal (limit: {})", jobs.size(), topic, limit);
+        }
+        
+        return jobs;
     }
 
     /**
@@ -313,6 +439,7 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         Long tokenTimestamp = properties.get(PROP_TOKEN_TIMESTAMP, Long.class);
         String tokenSignature = properties.get(PROP_TOKEN_SIGNATURE, String.class);
         String jobName = properties.get(PROP_JOB_NAME, String.class);
+        String submittedBy = properties.get(PROP_SUBMITTED_BY, String.class);
         Long persistedAt = properties.get(PROP_PERSISTED_AT, Long.class);
         
         if (topic == null || tokenTimestamp == null || jobName == null) {
@@ -340,6 +467,7 @@ public class JcrJobPersistenceService implements JobPersistenceService {
             topic,
             token,
             jobName,
+            submittedBy != null ? submittedBy : "unknown",
             parameters,
             persistedAt != null ? persistedAt : 0
         );

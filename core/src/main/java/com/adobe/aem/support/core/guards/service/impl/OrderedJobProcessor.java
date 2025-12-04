@@ -439,9 +439,11 @@ public class OrderedJobProcessor implements JobProcessor {
         }
 
         try {
-            String persistenceId = persistence.persist(topic, token, job.getName(), parameters);
-            LOG.info("Job submitted and persisted: topic={}, jobName={}, id={}",
-                    topic, job.getName(), persistenceId);
+            // Extract user ID from parameters (set by JobSubmitServlet)
+            String submittedBy = (String) parameters.get("_submittedBy");
+            String persistenceId = persistence.persist(topic, token, job.getName(), submittedBy, parameters);
+            LOG.info("Job submitted and persisted: topic={}, jobName={}, submittedBy={}, id={}",
+                    topic, job.getName(), submittedBy, persistenceId);
 
             // Update last seen time to trigger coalesce
             lastJobSeenTime = System.currentTimeMillis();

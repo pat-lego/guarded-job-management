@@ -27,14 +27,15 @@ public interface JobPersistenceService {
     /**
      * Persists a job to durable storage.
      *
-     * @param topic      the job topic
-     * @param token      the guarded order token
-     * @param jobName    the name of the job implementation
-     * @param parameters the job parameters
+     * @param topic       the job topic
+     * @param token       the guarded order token
+     * @param jobName     the name of the job implementation
+     * @param submittedBy the user ID who submitted the job
+     * @param parameters  the job parameters
      * @return a unique persistence ID for later removal
      * @throws JobPersistenceException if persistence fails
      */
-    String persist(String topic, String token, String jobName, Map<String, Object> parameters) 
+    String persist(String topic, String token, String jobName, String submittedBy, Map<String, Object> parameters) 
         throws JobPersistenceException;
 
     /**
@@ -57,6 +58,16 @@ public interface JobPersistenceService {
     List<PersistedJob> loadAll() throws JobPersistenceException;
 
     /**
+     * Loads persisted jobs for a specific topic, ordered by token timestamp.
+     *
+     * @param topic the topic to filter by
+     * @param limit maximum number of jobs to return
+     * @return list of persisted jobs for the topic, ordered by token timestamp ascending
+     * @throws JobPersistenceException if loading fails
+     */
+    List<PersistedJob> loadByTopic(String topic, int limit) throws JobPersistenceException;
+
+    /**
      * Checks if persistence is enabled.
      *
      * @return true if jobs will be persisted, false otherwise
@@ -71,15 +82,17 @@ public interface JobPersistenceService {
         private final String topic;
         private final String token;
         private final String jobName;
+        private final String submittedBy;
         private final Map<String, Object> parameters;
         private final long persistedAt;
 
         public PersistedJob(String persistenceId, String topic, String token, 
-                          String jobName, Map<String, Object> parameters, long persistedAt) {
+                          String jobName, String submittedBy, Map<String, Object> parameters, long persistedAt) {
             this.persistenceId = persistenceId;
             this.topic = topic;
             this.token = token;
             this.jobName = jobName;
+            this.submittedBy = submittedBy;
             this.parameters = parameters;
             this.persistedAt = persistedAt;
         }
@@ -98,6 +111,10 @@ public interface JobPersistenceService {
 
         public String getJobName() {
             return jobName;
+        }
+
+        public String getSubmittedBy() {
+            return submittedBy;
         }
 
         public Map<String, Object> getParameters() {

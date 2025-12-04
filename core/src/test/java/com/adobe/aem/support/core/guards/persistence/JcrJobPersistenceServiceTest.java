@@ -68,7 +68,7 @@ class JcrJobPersistenceServiceTest {
         parameters.put("message", "Hello World");
         parameters.put("count", 42);
 
-        String persistenceId = persistenceService.persist(topic, token, jobName, parameters);
+        String persistenceId = persistenceService.persist(topic, token, jobName, "admin", parameters);
 
         assertNotNull(persistenceId);
         assertTrue(persistenceId.startsWith(STORAGE_PATH + "/" + TEST_SLING_ID));
@@ -88,7 +88,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void persist_createsDateBasedPath() throws Exception {
-        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", Map.of());
+        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", "admin", Map.of());
 
         // Path should include date components: /var/guarded-jobs/{slingId}/{year}/{month}/{day}/{jobId}
         String[] segments = persistenceId.split("/");
@@ -107,7 +107,7 @@ class JcrJobPersistenceServiceTest {
         parameters.put("intParam", 123);
         parameters.put("boolParam", true);
 
-        persistenceService.persist("topic", "12345.sig", "job", parameters);
+        persistenceService.persist("topic", "12345.sig", "job", "admin", parameters);
 
         // Load the job and verify parameters
         when(clusterLeaderService.isLeader()).thenReturn(true);
@@ -123,7 +123,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void remove_deletesJobFromJcr() throws Exception {
-        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", Map.of());
+        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", "admin", Map.of());
 
         // Verify it exists
         assertNotNull(context.resourceResolver().getResource(persistenceId));
@@ -151,7 +151,7 @@ class JcrJobPersistenceServiceTest {
     @Test
     void loadAll_returnsEmptyListWhenNotLeader() throws Exception {
         // Persist a job
-        persistenceService.persist("topic", "12345.sig", "job", Map.of());
+        persistenceService.persist("topic", "12345.sig", "job", "admin", Map.of());
 
         // Set as non-leader
         when(clusterLeaderService.isLeader()).thenReturn(false);
@@ -164,9 +164,9 @@ class JcrJobPersistenceServiceTest {
     @Test
     void loadAll_loadsAllJobsWhenLeader() throws Exception {
         // Persist multiple jobs with different timestamps for ordering
-        persistenceService.persist("topic1", "100.sig", "job1", Map.of("key", "value1"));
-        persistenceService.persist("topic2", "200.sig", "job2", Map.of("key", "value2"));
-        persistenceService.persist("topic3", "300.sig", "job3", Map.of("key", "value3"));
+        persistenceService.persist("topic1", "100.sig", "job1", "admin", Map.of("key", "value1"));
+        persistenceService.persist("topic2", "200.sig", "job2", "admin", Map.of("key", "value2"));
+        persistenceService.persist("topic3", "300.sig", "job3", "admin", Map.of("key", "value3"));
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
 
@@ -183,7 +183,7 @@ class JcrJobPersistenceServiceTest {
         Map<String, Object> parameters = new HashMap<>();
         parameters.put("message", "Hello");
 
-        persistenceService.persist(topic, token, jobName, parameters);
+        persistenceService.persist(topic, token, jobName, "admin", parameters);
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
@@ -211,7 +211,7 @@ class JcrJobPersistenceServiceTest {
     @Test
     void loadAll_loadsJobsFromAllSlingIds() throws Exception {
         // Persist job with current sling ID
-        persistenceService.persist("topic1", "100.sig", "job1", Map.of());
+        persistenceService.persist("topic1", "100.sig", "job1", "admin", Map.of());
 
         // Manually create a job under a different sling ID to simulate another instance
         // Use the new property format with gjm: namespace
@@ -233,9 +233,9 @@ class JcrJobPersistenceServiceTest {
     @Test
     void loadAll_returnsJobsOrderedByTimestamp() throws Exception {
         // Persist jobs in non-chronological order
-        persistenceService.persist("topic", "300.sig", "job3", Map.of());
-        persistenceService.persist("topic", "100.sig", "job1", Map.of());
-        persistenceService.persist("topic", "200.sig", "job2", Map.of());
+        persistenceService.persist("topic", "300.sig", "job3", "admin", Map.of());
+        persistenceService.persist("topic", "100.sig", "job1", "admin", Map.of());
+        persistenceService.persist("topic", "200.sig", "job2", "admin", Map.of());
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
@@ -250,9 +250,9 @@ class JcrJobPersistenceServiceTest {
     @Test
     void persist_multipleJobsSameDay() throws Exception {
         // Persist multiple jobs on the same day
-        String id1 = persistenceService.persist("topic", "100.sig", "job1", Map.of());
-        String id2 = persistenceService.persist("topic", "200.sig", "job2", Map.of());
-        String id3 = persistenceService.persist("topic", "300.sig", "job3", Map.of());
+        String id1 = persistenceService.persist("topic", "100.sig", "job1", "admin", Map.of());
+        String id2 = persistenceService.persist("topic", "200.sig", "job2", "admin", Map.of());
+        String id3 = persistenceService.persist("topic", "300.sig", "job3", "admin", Map.of());
 
         // All should be persisted
         assertNotNull(context.resourceResolver().getResource(id1));
@@ -277,7 +277,7 @@ class JcrJobPersistenceServiceTest {
         String jobName = "lifecycle-job";
         Map<String, Object> params = Map.of("step", "test");
 
-        String persistenceId = persistenceService.persist(topic, token, jobName, params);
+        String persistenceId = persistenceService.persist(topic, token, jobName, "admin", params);
         assertNotNull(persistenceId);
 
         // Load
@@ -297,7 +297,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void persist_handlesEmptyParameters() throws Exception {
-        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", Map.of());
+        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", "admin", Map.of());
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
@@ -308,7 +308,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void persist_handlesNullParameters() throws Exception {
-        persistenceService.persist("topic", "12345.sig", "job", null);
+        persistenceService.persist("topic", "12345.sig", "job", "admin", null);
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
@@ -320,7 +320,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void persist_splitsTokenCorrectly() throws Exception {
-        String persistenceId = persistenceService.persist("topic", "9876543210.my-signature-value", "job", Map.of());
+        String persistenceId = persistenceService.persist("topic", "9876543210.my-signature-value", "job", "admin", Map.of());
 
         Resource jobResource = context.resourceResolver().getResource(persistenceId);
         assertNotNull(jobResource);
@@ -332,7 +332,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void loadAll_reconstructsTokenFromParts() throws Exception {
-        persistenceService.persist("topic", "1234567890.abcdef123", "job", Map.of());
+        persistenceService.persist("topic", "1234567890.abcdef123", "job", "admin", Map.of());
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
@@ -347,14 +347,14 @@ class JcrJobPersistenceServiceTest {
     void persist_throwsOnInvalidTokenFormat() {
         // Token without a dot separator should fail
         assertThrows(JobPersistenceService.JobPersistenceException.class,
-            () -> persistenceService.persist("topic", "invalid-token-no-dot", "job", Map.of()));
+            () -> persistenceService.persist("topic", "invalid-token-no-dot", "job", "admin", Map.of()));
     }
 
     @Test
     void persist_throwsOnNonNumericTimestamp() {
         // Token with non-numeric timestamp should fail
         assertThrows(JobPersistenceService.JobPersistenceException.class,
-            () -> persistenceService.persist("topic", "not-a-number.signature", "job", Map.of()));
+            () -> persistenceService.persist("topic", "not-a-number.signature", "job", "admin", Map.of()));
     }
 
     // === PersistedJob tests ===
@@ -366,7 +366,7 @@ class JcrJobPersistenceServiceTest {
         String jobName = "test-job";
         Map<String, Object> params = Map.of("key", "value");
 
-        persistenceService.persist(topic, token, jobName, params);
+        persistenceService.persist(topic, token, jobName, "admin", params);
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
@@ -390,6 +390,7 @@ class JcrJobPersistenceServiceTest {
             "my-topic",
             "12345.sig",
             "my-job",
+            "test-user",
             params,
             1234567890L
         );
@@ -398,7 +399,99 @@ class JcrJobPersistenceServiceTest {
         assertEquals("my-topic", job.getTopic());
         assertEquals("12345.sig", job.getToken());
         assertEquals("my-job", job.getJobName());
+        assertEquals("test-user", job.getSubmittedBy());
         assertEquals(params, job.getParameters());
         assertEquals(1234567890L, job.getPersistedAt());
+    }
+
+    @Test
+    void persist_storesSubmittedBy() throws Exception {
+        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", "test-user", Map.of());
+
+        Resource jobResource = context.resourceResolver().getResource(persistenceId);
+        assertNotNull(jobResource);
+        assertEquals("test-user", jobResource.getValueMap().get("gjm:submittedBy", String.class));
+    }
+
+    @Test
+    void loadAll_returnsSubmittedBy() throws Exception {
+        persistenceService.persist("topic", "12345.sig", "job", "creator-user", Map.of());
+
+        when(clusterLeaderService.isLeader()).thenReturn(true);
+        List<PersistedJob> jobs = persistenceService.loadAll();
+
+        assertEquals(1, jobs.size());
+        assertEquals("creator-user", jobs.get(0).getSubmittedBy());
+    }
+
+    @Test
+    void persist_handlesNullSubmittedBy() throws Exception {
+        persistenceService.persist("topic", "12345.sig", "job", null, Map.of());
+
+        when(clusterLeaderService.isLeader()).thenReturn(true);
+        List<PersistedJob> jobs = persistenceService.loadAll();
+
+        assertEquals(1, jobs.size());
+        assertEquals("unknown", jobs.get(0).getSubmittedBy());
+    }
+
+    // === loadByTopic tests ===
+
+    @Test
+    void loadByTopic_returnsJobsForTopic() throws Exception {
+        persistenceService.persist("topic-a", "100.sig", "job1", "user1", Map.of());
+        persistenceService.persist("topic-b", "200.sig", "job2", "user2", Map.of());
+        persistenceService.persist("topic-a", "300.sig", "job3", "user3", Map.of());
+
+        List<PersistedJob> jobs = persistenceService.loadByTopic("topic-a", 100);
+
+        assertEquals(2, jobs.size());
+        assertTrue(jobs.stream().allMatch(j -> "topic-a".equals(j.getTopic())));
+    }
+
+    @Test
+    void loadByTopic_ordersJobsByTimestamp() throws Exception {
+        persistenceService.persist("topic", "300.sig", "job3", "admin", Map.of());
+        persistenceService.persist("topic", "100.sig", "job1", "admin", Map.of());
+        persistenceService.persist("topic", "200.sig", "job2", "admin", Map.of());
+
+        List<PersistedJob> jobs = persistenceService.loadByTopic("topic", 100);
+
+        assertEquals(3, jobs.size());
+        assertEquals("100.sig", jobs.get(0).getToken());
+        assertEquals("200.sig", jobs.get(1).getToken());
+        assertEquals("300.sig", jobs.get(2).getToken());
+    }
+
+    @Test
+    void loadByTopic_respectsLimit() throws Exception {
+        for (int i = 1; i <= 10; i++) {
+            persistenceService.persist("topic", i * 100 + ".sig", "job" + i, "admin", Map.of());
+        }
+
+        List<PersistedJob> jobs = persistenceService.loadByTopic("topic", 5);
+
+        assertEquals(5, jobs.size());
+    }
+
+    @Test
+    void loadByTopic_returnsEmptyListForUnknownTopic() throws Exception {
+        persistenceService.persist("topic-a", "100.sig", "job", "admin", Map.of());
+
+        List<PersistedJob> jobs = persistenceService.loadByTopic("topic-unknown", 100);
+
+        assertTrue(jobs.isEmpty());
+    }
+
+    @Test
+    void loadByTopic_returnsEmptyListForNullTopic() throws Exception {
+        List<PersistedJob> jobs = persistenceService.loadByTopic(null, 100);
+        assertTrue(jobs.isEmpty());
+    }
+
+    @Test
+    void loadByTopic_returnsEmptyListForEmptyTopic() throws Exception {
+        List<PersistedJob> jobs = persistenceService.loadByTopic("", 100);
+        assertTrue(jobs.isEmpty());
     }
 }

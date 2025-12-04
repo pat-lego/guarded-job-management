@@ -155,7 +155,7 @@ class OrderedJobProcessorTest {
         String token = tokenService.generateToken();
         String expectedId = "/var/guarded-jobs/test-id";
         
-        when(persistenceService.persist(eq("topic"), eq(token), eq("test-job"), any()))
+        when(persistenceService.persist(eq("topic"), eq(token), eq("test-job"), any(), any()))
             .thenReturn(expectedId);
         
         CompletableFuture<String> future = processor.submit("topic", token, 
@@ -165,14 +165,14 @@ class OrderedJobProcessorTest {
         assertNull(future.get(1, TimeUnit.SECONDS));
         
         // Verify persistence was called
-        verify(persistenceService).persist(eq("topic"), eq(token), eq("test-job"), any());
+        verify(persistenceService).persist(eq("topic"), eq(token), eq("test-job"), any(), any());
     }
 
     @Test
     void submit_failsWhenPersistenceFails() throws Exception {
         String token = tokenService.generateToken();
         
-        when(persistenceService.persist(any(), any(), any(), any()))
+        when(persistenceService.persist(any(), any(), any(), any(), any()))
             .thenThrow(new JobPersistenceException("Persistence failed"));
         
         CompletableFuture<String> future = processor.submit("topic", token, 
@@ -188,13 +188,13 @@ class OrderedJobProcessorTest {
         String token = tokenService.generateToken();
         Map<String, Object> params = Map.of("message", "hello", "count", 42);
         
-        when(persistenceService.persist(any(), any(), any(), any()))
+        when(persistenceService.persist(any(), any(), any(), any(), any()))
             .thenReturn("/var/guarded-jobs/id");
         
         processor.submit("my-topic", token, testJob("my-job"), params);
         
         ArgumentCaptor<Map<String, Object>> paramsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(persistenceService).persist(eq("my-topic"), eq(token), eq("my-job"), paramsCaptor.capture());
+        verify(persistenceService).persist(eq("my-topic"), eq(token), eq("my-job"), any(), paramsCaptor.capture());
         
         assertEquals("hello", paramsCaptor.getValue().get("message"));
         assertEquals(42, paramsCaptor.getValue().get("count"));
@@ -257,6 +257,7 @@ class OrderedJobProcessorTest {
             "topic",
             token,
             "test-job",
+            "admin",
             Map.of(),
             System.currentTimeMillis()
         );
@@ -309,9 +310,9 @@ class OrderedJobProcessorTest {
         
         // Create persisted jobs - returned in sorted order (as JCR query would return them)
         List<PersistedJob> persistedJobs = List.of(
-            new PersistedJob("/var/guarded-jobs/1", "topic", token1, "job1", Map.of(), System.currentTimeMillis()),
-            new PersistedJob("/var/guarded-jobs/2", "topic", token2, "job2", Map.of(), System.currentTimeMillis()),
-            new PersistedJob("/var/guarded-jobs/3", "topic", token3, "job3", Map.of(), System.currentTimeMillis())
+            new PersistedJob("/var/guarded-jobs/1", "topic", token1, "job1", "admin", Map.of(), System.currentTimeMillis()),
+            new PersistedJob("/var/guarded-jobs/2", "topic", token2, "job2", "admin", Map.of(), System.currentTimeMillis()),
+            new PersistedJob("/var/guarded-jobs/3", "topic", token3, "job3", "admin", Map.of(), System.currentTimeMillis())
         );
         
         when(persistenceService.loadAll())
@@ -340,6 +341,7 @@ class OrderedJobProcessorTest {
             "topic",
             token,
             "unknown-job",
+            "admin",
             Map.of(),
             System.currentTimeMillis()
         );
@@ -380,9 +382,9 @@ class OrderedJobProcessorTest {
         String token3 = tokenService.generateToken();
         
         List<PersistedJob> jobs = List.of(
-            new PersistedJob("/id1", "topic-a", token1, "job", Map.of(), 0),
-            new PersistedJob("/id2", "topic-a", token2, "job", Map.of(), 0),
-            new PersistedJob("/id3", "topic-b", token3, "job", Map.of(), 0)
+            new PersistedJob("/id1", "topic-a", token1, "job", "admin", Map.of(), 0),
+            new PersistedJob("/id2", "topic-a", token2, "job", "admin", Map.of(), 0),
+            new PersistedJob("/id3", "topic-b", token3, "job", "admin", Map.of(), 0)
         );
         
         when(persistenceService.loadAll()).thenReturn(jobs);
@@ -398,8 +400,8 @@ class OrderedJobProcessorTest {
         String token2 = tokenService.generateToken();
         
         List<PersistedJob> jobs = List.of(
-            new PersistedJob("/id1", "topic-a", token1, "job", Map.of(), 0),
-            new PersistedJob("/id2", "topic-b", token2, "job", Map.of(), 0)
+            new PersistedJob("/id1", "topic-a", token1, "job", "admin", Map.of(), 0),
+            new PersistedJob("/id2", "topic-b", token2, "job", "admin", Map.of(), 0)
         );
         
         when(persistenceService.loadAll()).thenReturn(jobs);
@@ -459,6 +461,7 @@ class OrderedJobProcessorTest {
             "topic",
             token,
             "never-completing-async-job",
+            "admin",
             Map.of(),
             System.currentTimeMillis()
         );
@@ -537,6 +540,7 @@ class OrderedJobProcessorTest {
             "topic",
             token,
             "completing-async-job",
+            "admin",
             Map.of(),
             System.currentTimeMillis()
         );
@@ -609,6 +613,7 @@ class OrderedJobProcessorTest {
             "topic",
             token,
             "async-job-no-timeout",
+            "admin",
             Map.of(),
             System.currentTimeMillis()
         );
@@ -693,6 +698,7 @@ class OrderedJobProcessorTest {
             "topic",
             token,
             "async-no-isComplete-override",
+            "admin",
             Map.of(),
             System.currentTimeMillis()
         );

@@ -59,6 +59,11 @@ public class JobSubmitServlet extends SlingAllMethodsServlet {
      * Jobs that need the user's session should retrieve it from parameters using this key.
      */
     public static final String PARAM_RESOURCE_RESOLVER = "_resourceResolver";
+    
+    /**
+     * Parameter key for the user ID who submitted the job.
+     */
+    public static final String PARAM_SUBMITTED_BY = "_submittedBy";
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY)
     private JobProcessor jobProcessor;
@@ -125,9 +130,10 @@ public class JobSubmitServlet extends SlingAllMethodsServlet {
                 }
             }
             
-            // Pass the user's ResourceResolver to jobs that need it
+            // Pass the user's ResourceResolver and user ID to jobs that need it
             ResourceResolver resolver = request.getResourceResolver();
             parameters.put(PARAM_RESOURCE_RESOLVER, resolver);
+            parameters.put(PARAM_SUBMITTED_BY, resolver.getUserID());
 
             // Find the job
             GuardedJob<?> job = jobs.get(jobName);
