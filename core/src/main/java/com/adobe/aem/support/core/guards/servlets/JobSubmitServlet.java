@@ -13,6 +13,8 @@ import org.osgi.service.component.annotations.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.sling.api.resource.ResourceResolver;
+
 import javax.servlet.Servlet;
 import javax.servlet.ServletException;
 import java.io.IOException;
@@ -51,6 +53,12 @@ public class JobSubmitServlet extends SlingAllMethodsServlet {
 
     private static final Logger LOG = LoggerFactory.getLogger(JobSubmitServlet.class);
     private static final Gson GSON = new Gson();
+    
+    /**
+     * Parameter key for the ResourceResolver passed to jobs.
+     * Jobs that need the user's session should retrieve it from parameters using this key.
+     */
+    public static final String PARAM_RESOURCE_RESOLVER = "_resourceResolver";
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY)
     private JobProcessor jobProcessor;
@@ -116,6 +124,10 @@ public class JobSubmitServlet extends SlingAllMethodsServlet {
                     parameters.put(key, GSON.fromJson(params.get(key), Object.class));
                 }
             }
+            
+            // Pass the user's ResourceResolver to jobs that need it
+            ResourceResolver resolver = request.getResourceResolver();
+            parameters.put(PARAM_RESOURCE_RESOLVER, resolver);
 
             // Find the job
             GuardedJob<?> job = jobs.get(jobName);
