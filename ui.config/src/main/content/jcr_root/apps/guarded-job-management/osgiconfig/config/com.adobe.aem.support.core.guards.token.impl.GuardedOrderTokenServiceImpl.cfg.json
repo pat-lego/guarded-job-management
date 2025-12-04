@@ -1,0 +1,4 @@
+{
+    "secretKey": "$[env:GUARDED_TOKEN_SECRET_KEY;default=change-me-in-production]"
+}
+

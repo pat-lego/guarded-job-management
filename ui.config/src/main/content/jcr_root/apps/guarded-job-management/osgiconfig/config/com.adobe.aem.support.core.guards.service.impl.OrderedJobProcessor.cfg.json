@@ -1,0 +1,5 @@
+{
+    "coalesceTimeMs": 50,
+    "jobTimeoutSeconds": 30
+}
+

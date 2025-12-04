@@ -1,0 +1,9 @@
+{
+  "name": "guarded-job-scripts",
+  "type": "module",
+  "scripts": {
+    "submit": "node submit-jobs.mjs",
+    "list": "node -e \"fetch('http://localhost:4502/bin/guards/job.list.json',{headers:{Authorization:'Basic '+Buffer.from('admin:admin').toString('base64')}}).then(r=>r.json()).then(console.log)\""
+  }
+}
+
