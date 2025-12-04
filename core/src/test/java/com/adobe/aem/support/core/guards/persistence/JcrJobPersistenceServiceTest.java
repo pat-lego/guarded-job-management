@@ -17,7 +17,6 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
 import org.mockito.junit.jupiter.MockitoSettings;
@@ -78,16 +77,18 @@ class JcrJobPersistenceServiceTest {
         Resource jobResource = context.resourceResolver().getResource(persistenceId);
         assertNotNull(jobResource, "Job resource should exist at: " + persistenceId);
 
-        // Verify properties
-        assertEquals(topic, jobResource.getValueMap().get("topic", String.class));
-        assertEquals(token, jobResource.getValueMap().get("token", String.class));
-        assertEquals(jobName, jobResource.getValueMap().get("jobName", String.class));
+        // Verify properties (token is now split into tokenTimestamp and tokenSignature)
+        // Properties use gjm: namespace from the mixin
+        assertEquals(topic, jobResource.getValueMap().get("gjm:topic", String.class));
+        assertEquals(1234567890L, jobResource.getValueMap().get("gjm:tokenTimestamp", Long.class));
+        assertEquals("abc123signature", jobResource.getValueMap().get("gjm:tokenSignature", String.class));
+        assertEquals(jobName, jobResource.getValueMap().get("gjm:jobName", String.class));
         assertNotNull(jobResource.getValueMap().get("persistedAt", Long.class));
     }
 
     @Test
     void persist_createsDateBasedPath() throws Exception {
-        String persistenceId = persistenceService.persist("topic", "token.sig", "job", Map.of());
+        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", Map.of());
 
         // Path should include date components: /var/guarded-jobs/{slingId}/{year}/{month}/{day}/{jobId}
         String[] segments = persistenceId.split("/");
@@ -106,7 +107,7 @@ class JcrJobPersistenceServiceTest {
         parameters.put("intParam", 123);
         parameters.put("boolParam", true);
 
-        persistenceService.persist("topic", "token.sig", "job", parameters);
+        persistenceService.persist("topic", "12345.sig", "job", parameters);
 
         // Load the job and verify parameters
         when(clusterLeaderService.isLeader()).thenReturn(true);
@@ -122,7 +123,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void remove_deletesJobFromJcr() throws Exception {
-        String persistenceId = persistenceService.persist("topic", "token.sig", "job", Map.of());
+        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", Map.of());
 
         // Verify it exists
         assertNotNull(context.resourceResolver().getResource(persistenceId));
@@ -150,7 +151,7 @@ class JcrJobPersistenceServiceTest {
     @Test
     void loadAll_returnsEmptyListWhenNotLeader() throws Exception {
         // Persist a job
-        persistenceService.persist("topic", "token.sig", "job", Map.of());
+        persistenceService.persist("topic", "12345.sig", "job", Map.of());
 
         // Set as non-leader
         when(clusterLeaderService.isLeader()).thenReturn(false);
@@ -162,10 +163,10 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void loadAll_loadsAllJobsWhenLeader() throws Exception {
-        // Persist multiple jobs
-        persistenceService.persist("topic1", "token1.sig", "job1", Map.of("key", "value1"));
-        persistenceService.persist("topic2", "token2.sig", "job2", Map.of("key", "value2"));
-        persistenceService.persist("topic3", "token3.sig", "job3", Map.of("key", "value3"));
+        // Persist multiple jobs with different timestamps for ordering
+        persistenceService.persist("topic1", "100.sig", "job1", Map.of("key", "value1"));
+        persistenceService.persist("topic2", "200.sig", "job2", Map.of("key", "value2"));
+        persistenceService.persist("topic3", "300.sig", "job3", Map.of("key", "value3"));
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
 
@@ -191,7 +192,7 @@ class JcrJobPersistenceServiceTest {
         PersistedJob job = jobs.get(0);
         
         assertEquals(topic, job.getTopic());
-        assertEquals(token, job.getToken());
+        assertEquals(token, job.getToken()); // Token is reconstructed from timestamp + signature
         assertEquals(jobName, job.getJobName());
         assertEquals("Hello", job.getParameters().get("message"));
         assertTrue(job.getPersistedAt() > 0);
@@ -210,14 +211,16 @@ class JcrJobPersistenceServiceTest {
     @Test
     void loadAll_loadsJobsFromAllSlingIds() throws Exception {
         // Persist job with current sling ID
-        persistenceService.persist("topic1", "token1.sig", "job1", Map.of());
+        persistenceService.persist("topic1", "100.sig", "job1", Map.of());
 
         // Manually create a job under a different sling ID to simulate another instance
+        // Use the new property format with gjm: namespace
         String otherSlingIdPath = STORAGE_PATH + "/other-sling-id/2024/12/04/job-uuid";
         context.create().resource(otherSlingIdPath,
-            "topic", "topic2",
-            "token", "token2.sig",
-            "jobName", "job2",
+            "gjm:topic", "topic2",
+            "gjm:tokenTimestamp", 200L,
+            "gjm:tokenSignature", "other-sig",
+            "gjm:jobName", "job2",
             "persistedAt", System.currentTimeMillis());
         context.resourceResolver().commit();
 
@@ -228,11 +231,28 @@ class JcrJobPersistenceServiceTest {
     }
 
     @Test
+    void loadAll_returnsJobsOrderedByTimestamp() throws Exception {
+        // Persist jobs in non-chronological order
+        persistenceService.persist("topic", "300.sig", "job3", Map.of());
+        persistenceService.persist("topic", "100.sig", "job1", Map.of());
+        persistenceService.persist("topic", "200.sig", "job2", Map.of());
+
+        when(clusterLeaderService.isLeader()).thenReturn(true);
+        List<PersistedJob> jobs = persistenceService.loadAll();
+
+        assertEquals(3, jobs.size());
+        // Jobs should be returned in timestamp order (100, 200, 300)
+        assertEquals("100.sig", jobs.get(0).getToken());
+        assertEquals("200.sig", jobs.get(1).getToken());
+        assertEquals("300.sig", jobs.get(2).getToken());
+    }
+
+    @Test
     void persist_multipleJobsSameDay() throws Exception {
         // Persist multiple jobs on the same day
-        String id1 = persistenceService.persist("topic", "token1.sig", "job1", Map.of());
-        String id2 = persistenceService.persist("topic", "token2.sig", "job2", Map.of());
-        String id3 = persistenceService.persist("topic", "token3.sig", "job3", Map.of());
+        String id1 = persistenceService.persist("topic", "100.sig", "job1", Map.of());
+        String id2 = persistenceService.persist("topic", "200.sig", "job2", Map.of());
+        String id3 = persistenceService.persist("topic", "300.sig", "job3", Map.of());
 
         // All should be persisted
         assertNotNull(context.resourceResolver().getResource(id1));
@@ -253,7 +273,7 @@ class JcrJobPersistenceServiceTest {
     void fullLifecycle_persistLoadRemove() throws Exception {
         // Persist
         String topic = "lifecycle-topic";
-        String token = "lifecycle.token";
+        String token = "12345.lifecycle-token";
         String jobName = "lifecycle-job";
         Map<String, Object> params = Map.of("step", "test");
 
@@ -277,7 +297,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void persist_handlesEmptyParameters() throws Exception {
-        String persistenceId = persistenceService.persist("topic", "token.sig", "job", Map.of());
+        String persistenceId = persistenceService.persist("topic", "12345.sig", "job", Map.of());
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
@@ -288,7 +308,7 @@ class JcrJobPersistenceServiceTest {
 
     @Test
     void persist_handlesNullParameters() throws Exception {
-        persistenceService.persist("topic", "token.sig", "job", null);
+        persistenceService.persist("topic", "12345.sig", "job", null);
 
         when(clusterLeaderService.isLeader()).thenReturn(true);
         List<PersistedJob> jobs = persistenceService.loadAll();
@@ -296,5 +316,28 @@ class JcrJobPersistenceServiceTest {
         assertEquals(1, jobs.size());
         // Null should be serialized as "null" JSON and deserialized back to null or empty
         assertNotNull(jobs.get(0).getParameters());
+    }
+
+    @Test
+    void persist_splitsTokenCorrectly() throws Exception {
+        String persistenceId = persistenceService.persist("topic", "9876543210.my-signature-value", "job", Map.of());
+
+        Resource jobResource = context.resourceResolver().getResource(persistenceId);
+        assertNotNull(jobResource);
+
+        // Verify the token was split correctly (using gjm: namespace)
+        assertEquals(9876543210L, jobResource.getValueMap().get("gjm:tokenTimestamp", Long.class));
+        assertEquals("my-signature-value", jobResource.getValueMap().get("gjm:tokenSignature", String.class));
+    }
+
+    @Test
+    void loadAll_reconstructsTokenFromParts() throws Exception {
+        persistenceService.persist("topic", "1234567890.abcdef123", "job", Map.of());
+
+        when(clusterLeaderService.isLeader()).thenReturn(true);
+        List<PersistedJob> jobs = persistenceService.loadAll();
+
+        assertEquals(1, jobs.size());
+        assertEquals("1234567890.abcdef123", jobs.get(0).getToken());
     }
 }

@@ -163,6 +163,7 @@ public class OrderedJobProcessor implements JobProcessor {
         }
 
         try {
+            // JCR query returns jobs already sorted by timestamp with a limit (e.g., 100)
             List<PersistedJob> persistedJobs = persistence.loadAll();
             if (persistedJobs.isEmpty()) {
                 return;
@@ -176,16 +177,12 @@ public class OrderedJobProcessor implements JobProcessor {
             }
             lastJobSeenTime = now;
 
-            // Create mutable copy and sort by token timestamp for global ordering
-            List<PersistedJob> sortedJobs = new ArrayList<>(persistedJobs);
-            sortedJobs.sort(Comparator.comparingLong(job -> 
-                tokenService.extractTimestamp(job.getToken())));
-
-            LOG.debug("Processing {} jobs from JCR", sortedJobs.size());
+            LOG.debug("Processing {} jobs from JCR (already sorted by timestamp)", persistedJobs.size());
 
             // Group by topic for parallel processing across topics
+            // Jobs within each topic remain in timestamp order
             Map<String, List<PersistedJob>> jobsByTopic = new LinkedHashMap<>();
-            for (PersistedJob job : sortedJobs) {
+            for (PersistedJob job : persistedJobs) {
                 jobsByTopic.computeIfAbsent(job.getTopic(), k -> new ArrayList<>()).add(job);
             }
 

@@ -12,6 +12,8 @@ import org.osgi.service.component.annotations.Reference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.jcr.Session;
+import javax.jcr.query.Query;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -24,7 +26,7 @@ import java.util.*;
  * JCR-based implementation of {@link JobPersistenceService}.
  * 
  * <p>This service is always enabled and persists all jobs to JCR for durability.
- * Jobs are stored as JSON blobs organized by Sling ID and date to prevent large node trees.
+ * Jobs are stored with indexed timestamp fields to enable efficient querying.
  * Only the cluster leader can recover and process persisted jobs.</p>
  * 
  * <p>Storage structure:
@@ -37,12 +39,17 @@ import java.util.*;
  *           {job-id}/
  *             - jcr:primaryType = nt:unstructured
  *             - topic = "my-topic"
- *             - token = "..."
+ *             - tokenTimestamp = 1733325600001234567 (Long, indexed for queries)
+ *             - tokenSignature = "kX9mQz..." (String)
  *             - jobName = "echo"
  *             - persistedAt = 1733325600000
  *             - parameters (binary JSON blob)
  * </pre>
  * </p>
+ * 
+ * <p>The token is split into timestamp and signature to enable JCR queries
+ * that return jobs ordered by timestamp with a limit, avoiding loading all jobs
+ * into memory.</p>
  */
 @Component(service = JobPersistenceService.class, immediate = true)
 public class JcrJobPersistenceService implements JobPersistenceService {
@@ -51,15 +58,22 @@ public class JcrJobPersistenceService implements JobPersistenceService {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
 
-    private static final String PROP_TOPIC = "topic";
-    private static final String PROP_TOKEN = "token";
-    private static final String PROP_JOB_NAME = "jobName";
+    // Mixin and property names (gjm = guarded-job-management namespace)
+    private static final String MIXIN_GUARDED_JOB = "gjm:GuardedJob";
+    private static final String PROP_TOPIC = "gjm:topic";
+    private static final String PROP_TOKEN_TIMESTAMP = "gjm:tokenTimestamp";
+    private static final String PROP_TOKEN_SIGNATURE = "gjm:tokenSignature";
+    private static final String PROP_JOB_NAME = "gjm:jobName";
     private static final String PROP_PERSISTED_AT = "persistedAt";
     private static final String PROP_PARAMETERS = "parameters";
     private static final String NT_UNSTRUCTURED = "nt:unstructured";
+    private static final String JCR_MIXIN_TYPES = "jcr:mixinTypes";
 
     private static final String STORAGE_PATH = "/var/guarded-jobs";
     private static final String SERVICE_USER = "guarded-job-service";
+    
+    /** Maximum number of jobs to load per query. Prevents memory issues with large backlogs. */
+    private static final int MAX_JOBS_PER_QUERY = 100;
 
     @Reference
     private ResourceResolverFactory resolverFactory;
@@ -69,8 +83,8 @@ public class JcrJobPersistenceService implements JobPersistenceService {
 
     @Activate
     protected void activate() {
-        LOG.info("JcrJobPersistenceService activated: slingId={}, storagePath={}", 
-            clusterLeaderService.getSlingId(), STORAGE_PATH);
+        LOG.info("JcrJobPersistenceService activated: slingId={}, storagePath={}, maxJobsPerQuery={}", 
+            clusterLeaderService.getSlingId(), STORAGE_PATH, MAX_JOBS_PER_QUERY);
         
         ensureStoragePathExists();
     }
@@ -89,6 +103,17 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         String datePath = buildDatePath();
         String jobPath = STORAGE_PATH + "/" + slingId + "/" + datePath + "/" + jobId;
 
+        // Split token into timestamp and signature for indexed querying
+        long tokenTimestamp; 
+        String tokenSignature;
+        try {
+            String[] parts = token.split("\\.", 2);
+            tokenTimestamp = Long.parseLong(parts[0]);
+            tokenSignature = parts.length > 1 ? parts[1] : "";
+        } catch (Exception e) {
+            throw new JobPersistenceException("Invalid token format: " + token, e);
+        }
+
         try (ResourceResolver resolver = getServiceResolver()) {
             // Ensure date-based folder structure exists
             String parentPath = STORAGE_PATH + "/" + slingId + "/" + datePath;
@@ -102,8 +127,10 @@ public class JcrJobPersistenceService implements JobPersistenceService {
 
             Map<String, Object> properties = new HashMap<>();
             properties.put(ResourceResolver.PROPERTY_RESOURCE_TYPE, NT_UNSTRUCTURED);
+            properties.put(JCR_MIXIN_TYPES, new String[] { MIXIN_GUARDED_JOB });
             properties.put(PROP_TOPIC, topic);
-            properties.put(PROP_TOKEN, token);
+            properties.put(PROP_TOKEN_TIMESTAMP, tokenTimestamp);
+            properties.put(PROP_TOKEN_SIGNATURE, tokenSignature);
             properties.put(PROP_JOB_NAME, jobName);
             properties.put(PROP_PERSISTED_AT, System.currentTimeMillis());
             
@@ -116,7 +143,8 @@ public class JcrJobPersistenceService implements JobPersistenceService {
             resolver.create(parentResource, jobId, properties);
             resolver.commit();
 
-            LOG.debug("Persisted job: topic={}, jobName={}, path={}", topic, jobName, jobPath);
+            LOG.debug("Persisted job: topic={}, jobName={}, timestamp={}, path={}", 
+                topic, jobName, tokenTimestamp, jobPath);
             return jobPath;
 
         } catch (LoginException e) {
@@ -170,27 +198,15 @@ public class JcrJobPersistenceService implements JobPersistenceService {
                 return jobs;
             }
 
-            // Traverse: /var/guarded-jobs/{sling-id}/{year}/{month}/{day}/{job-id}
-            for (Resource slingIdResource : storageResource.getChildren()) {
-                for (Resource yearResource : slingIdResource.getChildren()) {
-                    for (Resource monthResource : yearResource.getChildren()) {
-                        for (Resource dayResource : monthResource.getChildren()) {
-                            for (Resource jobResource : dayResource.getChildren()) {
-                                try {
-                                    PersistedJob job = loadJob(jobResource);
-                                    if (job != null) {
-                                        jobs.add(job);
-                                    }
-                                } catch (Exception e) {
-                                    LOG.warn("Failed to load persisted job: {}", jobResource.getPath(), e);
-                                }
-                            }
-                        }
-                    }
-                }
+            // Try JCR query first (efficient for production with large job counts)
+            jobs = loadJobsViaQuery(resolver);
+            
+            // Fallback to traversal if query returned no results
+            // This handles mock environments and edge cases
+            if (jobs.isEmpty()) {
+                jobs = loadJobsViaTraversal(storageResource);
             }
-
-            LOG.info("Loaded {} persisted jobs from {}", jobs.size(), STORAGE_PATH);
+            
             return jobs;
 
         } catch (LoginException e) {
@@ -198,18 +214,114 @@ public class JcrJobPersistenceService implements JobPersistenceService {
         }
     }
 
+    /**
+     * Loads jobs using JCR SQL2 query - efficient for production with proper indexing.
+     * Returns jobs ordered by tokenTimestamp with a limit.
+     * 
+     * @see <a href="https://jackrabbit.apache.org/oak/docs/query/query-engine.html#query-option-offset-limit">Oak Query Options</a>
+     */
+    private List<PersistedJob> loadJobsViaQuery(ResourceResolver resolver) {
+        List<PersistedJob> jobs = new ArrayList<>();
+        
+        try {
+            // Use OPTION(LIMIT x) for efficient query limiting in Oak
+            // Query by mixin type for better index utilization
+            String query = String.format(
+                "SELECT * FROM [%s] AS job " +
+                "WHERE ISDESCENDANTNODE(job, '%s') " +
+                "ORDER BY job.[%s] ASC " +
+                "OPTION(LIMIT %d)",
+                MIXIN_GUARDED_JOB, STORAGE_PATH, PROP_TOKEN_TIMESTAMP, MAX_JOBS_PER_QUERY
+            );
+
+            Iterator<Resource> results = resolver.findResources(query, Query.JCR_SQL2);
+            
+            while (results.hasNext()) {
+                Resource jobResource = results.next();
+                try {
+                    PersistedJob job = loadJob(jobResource);
+                    if (job != null) {
+                        jobs.add(job);
+                    }
+                } catch (Exception e) {
+                    LOG.warn("Failed to load persisted job: {}", jobResource.getPath(), e);
+                }
+            }
+
+            if (!jobs.isEmpty()) {
+                LOG.debug("Loaded {} jobs via query (limit: {})", jobs.size(), MAX_JOBS_PER_QUERY);
+            }
+        } catch (Exception e) {
+            LOG.debug("Query failed, will use traversal fallback: {}", e.getMessage());
+        }
+        
+        return jobs;
+    }
+
+    /**
+     * Loads jobs via tree traversal - fallback for environments without query support.
+     * Returns jobs sorted by tokenTimestamp with a limit.
+     */
+    private List<PersistedJob> loadJobsViaTraversal(Resource storageResource) {
+        List<PersistedJob> jobs = new ArrayList<>();
+        
+        // Traverse: /var/guarded-jobs/{sling-id}/{year}/{month}/{day}/{job-id}
+        for (Resource slingIdResource : storageResource.getChildren()) {
+            for (Resource yearResource : slingIdResource.getChildren()) {
+                for (Resource monthResource : yearResource.getChildren()) {
+                    for (Resource dayResource : monthResource.getChildren()) {
+                        for (Resource jobResource : dayResource.getChildren()) {
+                            try {
+                                PersistedJob job = loadJob(jobResource);
+                                if (job != null) {
+                                    jobs.add(job);
+                                }
+                            } catch (Exception e) {
+                                LOG.warn("Failed to load persisted job: {}", jobResource.getPath(), e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by timestamp and limit
+        jobs.sort(Comparator.comparingLong(job -> {
+            try {
+                String[] parts = job.getToken().split("\\.", 2);
+                return Long.parseLong(parts[0]);
+            } catch (Exception e) {
+                return 0L;
+            }
+        }));
+        
+        if (jobs.size() > MAX_JOBS_PER_QUERY) {
+            jobs = jobs.subList(0, MAX_JOBS_PER_QUERY);
+        }
+
+        if (!jobs.isEmpty()) {
+            LOG.debug("Loaded {} jobs via traversal (limit: {})", jobs.size(), MAX_JOBS_PER_QUERY);
+        }
+        
+        return jobs;
+    }
+
     private PersistedJob loadJob(Resource jobResource) {
         ValueMap properties = jobResource.getValueMap();
         
         String topic = properties.get(PROP_TOPIC, String.class);
-        String token = properties.get(PROP_TOKEN, String.class);
+        Long tokenTimestamp = properties.get(PROP_TOKEN_TIMESTAMP, Long.class);
+        String tokenSignature = properties.get(PROP_TOKEN_SIGNATURE, String.class);
         String jobName = properties.get(PROP_JOB_NAME, String.class);
         Long persistedAt = properties.get(PROP_PERSISTED_AT, Long.class);
         
-        if (topic == null || token == null || jobName == null) {
+        if (topic == null || tokenTimestamp == null || jobName == null) {
             LOG.warn("Invalid persisted job (missing required properties): {}", jobResource.getPath());
             return null;
         }
+
+        // Reconstruct the token from timestamp and signature
+        String token = tokenTimestamp + "." + (tokenSignature != null ? tokenSignature : "");
 
         // Load parameters from binary property
         Map<String, Object> parameters = new HashMap<>();

@@ -306,11 +306,11 @@ class OrderedJobProcessorTest {
         String token2 = tokenService.generateToken();
         String token3 = tokenService.generateToken();
         
-        // Create persisted jobs - note: returned in different order
+        // Create persisted jobs - returned in sorted order (as JCR query would return them)
         List<PersistedJob> persistedJobs = List.of(
-            new PersistedJob("/var/guarded-jobs/3", "topic", token3, "job3", Map.of(), System.currentTimeMillis()),
             new PersistedJob("/var/guarded-jobs/1", "topic", token1, "job1", Map.of(), System.currentTimeMillis()),
-            new PersistedJob("/var/guarded-jobs/2", "topic", token2, "job2", Map.of(), System.currentTimeMillis())
+            new PersistedJob("/var/guarded-jobs/2", "topic", token2, "job2", Map.of(), System.currentTimeMillis()),
+            new PersistedJob("/var/guarded-jobs/3", "topic", token3, "job3", Map.of(), System.currentTimeMillis())
         );
         
         when(persistenceService.loadAll())

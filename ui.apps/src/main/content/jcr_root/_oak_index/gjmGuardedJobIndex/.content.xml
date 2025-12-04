@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Oak Lucene index for efficient GuardedJob queries.
+    
+    This index supports:
+    - Querying by gjm:GuardedJob mixin type
+    - Ordering by gjm:tokenTimestamp (ascending)
+    - Filtering by path under /var/guarded-jobs
+    
+    See: https://jackrabbit.apache.org/oak/docs/query/lucene.html
+-->
+<jcr:root xmlns:jcr="http://www.jcp.org/jcr/1.0" 
+          xmlns:nt="http://www.jcp.org/jcr/nt/1.0"
+          xmlns:oak="http://jackrabbit.apache.org/oak/ns/1.0"
+          xmlns:gjm="http://guarded-job-management.aem.adobe.com/1.0"
+    jcr:primaryType="oak:QueryIndexDefinition"
+    type="lucene"
+    async="async"
+    compatVersion="{Long}2"
+    evaluatePathRestrictions="{Boolean}true"
+    includedPaths="[/var/guarded-jobs]"
+    queryPaths="[/var/guarded-jobs]">
+    <indexRules jcr:primaryType="nt:unstructured">
+        <gjm:GuardedJob jcr:primaryType="nt:unstructured">
+            <properties jcr:primaryType="nt:unstructured">
+                <tokenTimestamp
+                    jcr:primaryType="nt:unstructured"
+                    name="gjm:tokenTimestamp"
+                    propertyIndex="{Boolean}true"
+                    ordered="{Boolean}true"
+                    type="Long"/>
+                <topic
+                    jcr:primaryType="nt:unstructured"
+                    name="gjm:topic"
+                    propertyIndex="{Boolean}true"
+                    type="String"/>
+                <jobName
+                    jcr:primaryType="nt:unstructured"
+                    name="gjm:jobName"
+                    propertyIndex="{Boolean}true"
+                    type="String"/>
+            </properties>
+        </gjm:GuardedJob>
+    </indexRules>
+</jcr:root>

@@ -377,12 +377,57 @@ Jobs flow through a distributed pipeline that ensures **global ordering** across
       12/                                  # Month
         04/                                # Day
           550e8400-e29b-41d4-a716-446655440000/
-            - topic: "my-topic"
-            - token: "1733325600001.kX9mQz..."
-            - jobName: "echo"
+            - jcr:mixinTypes: [gjm:GuardedJob]
+            - gjm:topic: "my-topic"
+            - gjm:tokenTimestamp: 1733325600001 (Long, indexed)
+            - gjm:tokenSignature: "kX9mQz..." (String)
+            - gjm:jobName: "echo"
             - persistedAt: 1733325600000
             - parameters: (binary JSON blob)
 ```
+
+#### Custom Mixin Node Type
+
+Jobs use a custom mixin `gjm:GuardedJob` (registered via repoinit) which:
+- Defines typed properties for job data
+- Enables efficient Oak index queries
+- Ensures data integrity with mandatory properties
+
+```cnd
+<gjm = 'http://guarded-job-management.aem.adobe.com/1.0'>
+
+[gjm:GuardedJob] > mix:created
+  mixin
+  - gjm:tokenTimestamp (long) mandatory
+  - gjm:tokenSignature (string)
+  - gjm:topic (string) mandatory
+  - gjm:jobName (string) mandatory
+```
+
+#### Oak Index
+
+A dedicated Lucene index (`gjmGuardedJobIndex`) is deployed to `/oak:index/` for efficient querying:
+- Indexes `gjm:GuardedJob` mixin nodes only
+- Supports ordering by `gjm:tokenTimestamp`
+- Scoped to `/var/guarded-jobs` path
+- Uses async indexing for minimal write impact
+
+#### Query-Based Loading
+
+Jobs are loaded using a JCR SQL2 query that:
+- Queries by `gjm:GuardedJob` mixin type for index utilization
+- Returns jobs ordered by `gjm:tokenTimestamp` (ascending)
+- Uses Oak's `OPTION(LIMIT x)` for efficient database-level limiting
+- Limits results to 100 jobs per poll
+
+```sql
+SELECT * FROM [gjm:GuardedJob] AS job
+WHERE ISDESCENDANTNODE(job, '/var/guarded-jobs')
+ORDER BY job.[gjm:tokenTimestamp] ASC
+OPTION(LIMIT 100)
+```
+
+This ensures the system can handle large job backlogs without memory issues. See [Oak Query Options](https://jackrabbit.apache.org/oak/docs/query/query-engine.html#query-option-offset-limit) for more details.
 
 > **Note:** Jobs are organized by date to prevent large node trees. Only the **cluster leader** can recover and process persisted jobs on startup.
 
@@ -517,11 +562,14 @@ guarded-job-management/
 │           ├── EchoJob.java                     # Example job
 │           └── EmptyGuardedJob.java             # Minimal example
 ├── ui.config/
-│   └── src/main/content/jcr_root/apps/.../osgiconfig/
-│       ├── com.adobe.aem.support.core.guards.token.impl.GuardedOrderTokenServiceImpl.cfg.json
-│       ├── com.adobe.aem.support.core.guards.service.impl.OrderedJobProcessor.cfg.json
-│       ├── org.apache.sling.serviceusermapping.impl.ServiceUserMapperImpl.amended-guarded-job-management.cfg.json
-│       └── org.apache.sling.jcr.repoinit.RepositoryInitializer~guarded-job-management.cfg.json
+│   └── src/main/content/jcr_root/
+│       ├── apps/.../osgiconfig/
+│       │   ├── com.adobe.aem.support.core.guards.token.impl.GuardedOrderTokenServiceImpl.cfg.json
+│       │   ├── com.adobe.aem.support.core.guards.service.impl.OrderedJobProcessor.cfg.json
+│       │   ├── org.apache.sling.serviceusermapping.impl.ServiceUserMapperImpl.amended-guarded-job-management.cfg.json
+│       │   └── org.apache.sling.jcr.repoinit.RepositoryInitializer~guarded-job-management.cfg.json
+│       └── _oak_index/
+│           └── gjmGuardedJobIndex/         # Oak Lucene index for job queries
 ├── scripts/
 │   ├── submit-jobs.mjs                          # Test script
 │   └── package.json
