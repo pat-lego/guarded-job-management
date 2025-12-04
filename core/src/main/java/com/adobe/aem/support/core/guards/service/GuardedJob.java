@@ -27,6 +27,11 @@ import java.util.Map;
  *         pageManager.publish(pagePath);
  *         return "Published: " + pagePath;
  *     }
+ *     
+ *     @Override
+ *     public long getTimeoutSeconds() {
+ *         return 120; // Allow 2 minutes for publishing
+ *     }
  * }
  * }</pre>
  * </p>
@@ -56,4 +61,20 @@ public interface GuardedJob<T> {
      * @throws Exception if the job fails during execution
      */
     T execute(Map<String, Object> parameters) throws Exception;
+
+
+    /**
+     * Returns the timeout in seconds for this job.
+     * 
+     * <p>Override this method to specify a custom timeout for this job type.
+     * Return a positive value to set a specific timeout, or return -1 (default)
+     * to use the global timeout configured in {@code OrderedJobProcessor}.</p>
+     * 
+     * <p>Returning 0 disables timeout for this job (use with caution).</p>
+     *
+     * @return the timeout in seconds, 0 to disable timeout, or -1 to use the global default
+     */
+    default long getTimeoutSeconds() {
+        return -1; // Use global default
+    }
 }

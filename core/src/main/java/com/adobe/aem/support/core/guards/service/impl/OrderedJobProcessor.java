@@ -19,23 +19,31 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * OSGi implementation of {@link JobProcessor} that processes jobs in token order,
+ * OSGi implementation of {@link JobProcessor} that processes jobs in token
+ * order,
  * grouped by topic.
  * 
- * <p><b>Distributed Architecture:</b></p>
+ * <p>
+ * <b>Distributed Architecture:</b>
+ * </p>
  * <ol>
- *   <li>Any AEM instance can receive job submissions via HTTP</li>
- *   <li>Jobs are persisted to JCR</li>
- *   <li><b>Only the cluster leader</b> polls JCR and processes jobs</li>
- *   <li>Jobs are processed in token order (global ordering across all instances)</li>
- *   <li>Jobs are deleted from JCR after successful processing</li>
+ * <li>Any AEM instance can receive job submissions via HTTP</li>
+ * <li>Jobs are persisted to JCR</li>
+ * <li><b>Only the cluster leader</b> polls JCR and processes jobs</li>
+ * <li>Jobs are processed in token order (global ordering across all
+ * instances)</li>
+ * <li>Jobs are deleted from JCR after successful processing</li>
  * </ol>
  * 
- * <p>A configurable coalesce time allows jobs arriving from different machines
- * to be properly ordered before processing begins.</p>
+ * <p>
+ * A configurable coalesce time allows jobs arriving from different machines
+ * to be properly ordered before processing begins.
+ * </p>
  * 
- * <p>Jobs that exceed the configured timeout are cancelled to prevent
- * queue bottlenecking and high heap usage.</p>
+ * <p>
+ * Jobs that exceed the configured timeout are cancelled to prevent
+ * queue bottlenecking and high heap usage.
+ * </p>
  */
 @Component(service = JobProcessor.class, immediate = true)
 @Designate(ocd = OrderedJobProcessor.Config.class)
@@ -43,27 +51,15 @@ public class OrderedJobProcessor implements JobProcessor {
 
     private static final Logger LOG = LoggerFactory.getLogger(OrderedJobProcessor.class);
 
-    @ObjectClassDefinition(
-        name = "Ordered Job Processor",
-        description = "Configuration for the ordered job processor"
-    )
+    @ObjectClassDefinition(name = "Ordered Job Processor", description = "Configuration for the ordered job processor")
     @interface Config {
-        @AttributeDefinition(
-            name = "Coalesce Time (ms)",
-            description = "Time to wait for more jobs before processing. Allows jobs from different machines to be properly ordered."
-        )
+        @AttributeDefinition(name = "Coalesce Time (ms)", description = "Time to wait for more jobs before processing. Allows jobs from different machines to be properly ordered.")
         long coalesceTimeMs() default 50;
 
-        @AttributeDefinition(
-            name = "Job Timeout (seconds)",
-            description = "Maximum time a job is allowed to run before being cancelled. Set to 0 to disable timeout."
-        )
+        @AttributeDefinition(name = "Job Timeout (seconds)", description = "Maximum time a job is allowed to run before being cancelled. Set to 0 to disable timeout.")
         long jobTimeoutSeconds() default 30;
 
-        @AttributeDefinition(
-            name = "Job Poll Interval (ms)",
-            description = "How often the leader polls JCR for new jobs."
-        )
+        @AttributeDefinition(name = "Job Poll Interval (ms)", description = "How often the leader polls JCR for new jobs.")
         long jobPollIntervalMs() default 1000;
     }
 
@@ -78,15 +74,11 @@ public class OrderedJobProcessor implements JobProcessor {
 
     // Map of job name -> GuardedJob implementation
     private final Map<String, GuardedJob<?>> registeredJobs = new ConcurrentHashMap<>();
-    
+
     // Track jobs currently being processed to avoid re-polling them
     private final Set<String> processingJobs = ConcurrentHashMap.newKeySet();
 
-    @Reference(
-        cardinality = ReferenceCardinality.MULTIPLE,
-        policy = ReferencePolicy.DYNAMIC,
-        policyOption = ReferencePolicyOption.GREEDY
-    )
+    @Reference(cardinality = ReferenceCardinality.MULTIPLE, policy = ReferencePolicy.DYNAMIC, policyOption = ReferencePolicyOption.GREEDY)
     protected void bindGuardedJob(GuardedJob<?> job) {
         registeredJobs.put(job.getName(), job);
         LOG.debug("Registered job implementation: {}", job.getName());
@@ -99,71 +91,75 @@ public class OrderedJobProcessor implements JobProcessor {
 
     // Per-topic priority executors for sequential processing in timestamp order
     private final Map<String, PriorityExecutor> topicExecutors = new ConcurrentHashMap<>();
-    
+
     /**
-     * A single-threaded executor that processes jobs in priority order (by timestamp).
+     * A single-threaded executor that processes jobs in priority order (by
+     * timestamp).
      * This ensures that even if a job with an earlier timestamp arrives late,
      * it will still be processed before jobs with later timestamps.
      */
     private static class PriorityExecutor {
         private final ThreadPoolExecutor executor;
-        
+
         PriorityExecutor(String topic) {
-            // Comparator: first by timestamp, then by sequence number (for same-timestamp jobs)
+            // Comparator: first by timestamp, then by sequence number (for same-timestamp
+            // jobs)
             Comparator<Runnable> comparator = Comparator
-                .comparingLong((Runnable r) -> ((PrioritizedJobRunnable) r).timestamp)
-                .thenComparingLong(r -> ((PrioritizedJobRunnable) r).sequenceNumber);
-            
+                    .comparingLong((Runnable r) -> ((PrioritizedJobRunnable) r).timestamp)
+                    .thenComparingLong(r -> ((PrioritizedJobRunnable) r).sequenceNumber);
+
             PriorityBlockingQueue<Runnable> queue = new PriorityBlockingQueue<>(100, comparator);
             this.executor = new ThreadPoolExecutor(
-                1, 1, 0L, TimeUnit.MILLISECONDS,
-                queue,
-                r -> {
-                    Thread t = new Thread(r);
-                    t.setDaemon(true);
-                    t.setName("topic-executor-" + topic);
-                    return t;
-                }
-            );
+                    1, 1, 0L, TimeUnit.MILLISECONDS,
+                    queue,
+                    r -> {
+                        Thread t = new Thread(r);
+                        t.setDaemon(true);
+                        t.setName("topic-executor-" + topic);
+                        return t;
+                    });
         }
-        
+
         void submit(PrioritizedJobRunnable job) {
             executor.execute(job);
         }
-        
+
         void shutdown() {
             executor.shutdown();
         }
-        
+
         void shutdownNow() {
             executor.shutdownNow();
         }
     }
-    
+
     /**
      * A Runnable wrapper that carries the job's timestamp for priority ordering.
      * Jobs with lower timestamps (earlier) have higher priority.
-     * The sequence number serves as a tie-breaker for jobs with identical timestamps.
+     * The sequence number serves as a tie-breaker for jobs with identical
+     * timestamps.
      */
     private static class PrioritizedJobRunnable implements Runnable {
         private final long timestamp;
         private final long sequenceNumber;
         private final Runnable task;
-        
-        // Tie-breaker sequence for jobs with the same timestamp (preserves insertion order)
+
+        // Tie-breaker sequence for jobs with the same timestamp (preserves insertion
+        // order)
         private static final AtomicLong sequencer = new AtomicLong(0);
-        
+
         PrioritizedJobRunnable(long timestamp, Runnable task) {
             this.timestamp = timestamp;
             this.task = task;
             this.sequenceNumber = sequencer.incrementAndGet();
         }
-        
+
         @Override
         public void run() {
             task.run();
         }
     }
+
     private ScheduledExecutorService scheduler;
     private ScheduledFuture<?> jobPollerFuture;
     private long coalesceTimeMs;
@@ -183,9 +179,9 @@ public class OrderedJobProcessor implements JobProcessor {
             t.setName("job-processor-scheduler");
             return t;
         });
-        LOG.info("OrderedJobProcessor activated with coalesceTimeMs={}, jobTimeoutSeconds={}, jobPollIntervalMs={}", 
-            coalesceTimeMs, jobTimeoutSeconds, jobPollIntervalMs);
-        
+        LOG.info("OrderedJobProcessor activated with coalesceTimeMs={}, jobTimeoutSeconds={}, jobPollIntervalMs={}",
+                coalesceTimeMs, jobTimeoutSeconds, jobPollIntervalMs);
+
         // Start the job poller (only does work if leader)
         startJobPoller();
     }
@@ -201,11 +197,10 @@ public class OrderedJobProcessor implements JobProcessor {
      */
     private void startJobPoller() {
         jobPollerFuture = scheduler.scheduleWithFixedDelay(
-            this::pollAndProcessJobs,
-            jobPollIntervalMs,
-            jobPollIntervalMs,
-            TimeUnit.MILLISECONDS
-        );
+                this::pollAndProcessJobs,
+                jobPollIntervalMs,
+                jobPollIntervalMs,
+                TimeUnit.MILLISECONDS);
         LOG.debug("Job poller started with interval {}ms", jobPollIntervalMs);
     }
 
@@ -256,7 +251,7 @@ public class OrderedJobProcessor implements JobProcessor {
             for (Map.Entry<String, List<PersistedJob>> entry : jobsByTopic.entrySet()) {
                 String topic = entry.getKey();
                 List<PersistedJob> topicJobs = entry.getValue();
-                
+
                 // Process jobs for this topic sequentially in token order
                 processTopicJobs(topic, topicJobs, persistence);
             }
@@ -269,9 +264,11 @@ public class OrderedJobProcessor implements JobProcessor {
     /**
      * Processes jobs for a single topic sequentially in token order.
      * 
-     * <p>Uses a priority queue executor to ensure jobs are always processed
+     * <p>
+     * Uses a priority queue executor to ensure jobs are always processed
      * in timestamp order, even if a job with an earlier timestamp arrives late
-     * (e.g., due to network delays).</p>
+     * (e.g., due to network delays).
+     * </p>
      */
     private void processTopicJobs(String topic, List<PersistedJob> jobs, JobPersistenceService persistence) {
         PriorityExecutor topicExecutor = topicExecutors.computeIfAbsent(topic, PriorityExecutor::new);
@@ -284,8 +281,8 @@ public class OrderedJobProcessor implements JobProcessor {
 
             GuardedJob<?> jobImpl = registeredJobs.get(persistedJob.getJobName());
             if (jobImpl == null) {
-                LOG.warn("No implementation found for job '{}'. Removing from persistence.", 
-                    persistedJob.getJobName());
+                LOG.warn("No implementation found for job '{}'. Removing from persistence.",
+                        persistedJob.getJobName());
                 removeFromPersistence(persistence, persistedJob.getPersistenceId());
                 processingJobs.remove(persistedJob.getPersistenceId());
                 continue;
@@ -293,8 +290,9 @@ public class OrderedJobProcessor implements JobProcessor {
 
             // Extract timestamp from token for priority ordering
             long timestamp = tokenService.extractTimestamp(persistedJob.getToken());
-            
-            // Submit with priority based on timestamp (lower = higher priority = earlier execution)
+
+            // Submit with priority based on timestamp (lower = higher priority = earlier
+            // execution)
             Runnable task = () -> {
                 try {
                     executeJob(persistedJob, jobImpl);
@@ -304,10 +302,10 @@ public class OrderedJobProcessor implements JobProcessor {
                     processingJobs.remove(persistedJob.getPersistenceId());
                 }
             };
-            
+
             topicExecutor.submit(new PrioritizedJobRunnable(timestamp, task));
-            LOG.debug("Queued job for execution: topic={}, timestamp={}, id={}", 
-                topic, timestamp, persistedJob.getPersistenceId());
+            LOG.debug("Queued job for execution: topic={}, timestamp={}, id={}",
+                    topic, timestamp, persistedJob.getPersistenceId());
         }
     }
 
@@ -317,11 +315,15 @@ public class OrderedJobProcessor implements JobProcessor {
     private void executeJob(PersistedJob persistedJob, GuardedJob<?> jobImpl) {
         String jobName = persistedJob.getJobName();
         String topic = persistedJob.getTopic();
-        
-        LOG.debug("Executing job: topic={}, name={}, id={}", 
-            topic, jobName, persistedJob.getPersistenceId());
 
-        if (jobTimeoutSeconds <= 0) {
+        LOG.debug("Executing job: topic={}, name={}, id={}",
+                topic, jobName, persistedJob.getPersistenceId());
+
+        // Determine timeout: use job-specific timeout if set, otherwise use global default
+        long jobSpecificTimeout = jobImpl.getTimeoutSeconds();
+        long effectiveTimeout = (jobSpecificTimeout >= 0) ? jobSpecificTimeout : jobTimeoutSeconds;
+        
+        if (effectiveTimeout <= 0) {
             // No timeout, execute directly
             try {
                 jobImpl.execute(persistedJob.getParameters());
@@ -349,12 +351,12 @@ public class OrderedJobProcessor implements JobProcessor {
         });
 
         try {
-            jobFuture.get(jobTimeoutSeconds, TimeUnit.SECONDS);
+            jobFuture.get(effectiveTimeout, TimeUnit.SECONDS);
             LOG.debug("Job completed: {}", persistedJob.getPersistenceId());
         } catch (TimeoutException e) {
             LOG.warn("Job '{}' in topic '{}' cancelled after {} seconds (timeout). " +
-                     "This may indicate a stuck job causing queue bottlenecking.",
-                     jobName, topic, jobTimeoutSeconds);
+                    "This may indicate a stuck job causing queue bottlenecking.",
+                    jobName, topic, effectiveTimeout);
             jobFuture.cancel(true);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -378,7 +380,8 @@ public class OrderedJobProcessor implements JobProcessor {
     }
 
     @Override
-    public <T> CompletableFuture<T> submit(String topic, String token, GuardedJob<T> job, Map<String, Object> parameters) {
+    public <T> CompletableFuture<T> submit(String topic, String token, GuardedJob<T> job,
+            Map<String, Object> parameters) {
         validateSubmission(topic, token, job);
 
         if (shutdown) {
@@ -396,18 +399,18 @@ public class OrderedJobProcessor implements JobProcessor {
 
         try {
             String persistenceId = persistence.persist(topic, token, job.getName(), parameters);
-            LOG.info("Job submitted and persisted: topic={}, jobName={}, id={}", 
-                topic, job.getName(), persistenceId);
-            
+            LOG.info("Job submitted and persisted: topic={}, jobName={}, id={}",
+                    topic, job.getName(), persistenceId);
+
             // Update last seen time to trigger coalesce
             lastJobSeenTime = System.currentTimeMillis();
-            
+
             // Return completed future - actual execution happens via poller on leader
             // Result is not available since execution happens asynchronously
             CompletableFuture<T> future = new CompletableFuture<>();
             future.complete(null);
             return future;
-            
+
         } catch (JobPersistenceException e) {
             LOG.error("Failed to persist job: topic={}, jobName={}", topic, job.getName(), e);
             CompletableFuture<T> future = new CompletableFuture<>();
@@ -437,8 +440,8 @@ public class OrderedJobProcessor implements JobProcessor {
         }
         try {
             return (int) persistence.loadAll().stream()
-                .filter(job -> topic.equals(job.getTopic()))
-                .count();
+                    .filter(job -> topic.equals(job.getTopic()))
+                    .count();
         } catch (JobPersistenceException e) {
             LOG.warn("Failed to count pending jobs for topic: {}", topic, e);
             return 0;

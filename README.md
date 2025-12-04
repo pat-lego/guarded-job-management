@@ -327,9 +327,45 @@ To prevent queue bottlenecking and high heap usage from long-running or stuck jo
 
 Example log message:
 ```
-WARN  Job 'slow-task' in topic 'my-topic' cancelled after 30 seconds (timeout: 30s). 
-      This may indicate a long-running or stuck job that could cause queue bottlenecking and high heap usage.
+WARN  Job 'slow-task' in topic 'my-topic' cancelled after 30 seconds (timeout). 
+      This may indicate a stuck job causing queue bottlenecking.
 ```
+
+#### Per-Job Timeout Override
+
+Individual jobs can override the global timeout by implementing `getTimeoutSeconds()`:
+
+```java
+@Component(service = GuardedJob.class)
+public class LongRunningImportJob implements GuardedJob<String> {
+    
+    @Override
+    public String getName() {
+        return "import-large-dataset";
+    }
+    
+    @Override
+    public String execute(Map<String, Object> parameters) throws Exception {
+        // Long-running import logic...
+        return "Import completed";
+    }
+    
+    @Override
+    public long getTimeoutSeconds() {
+        return 300; // Allow 5 minutes for this job
+    }
+}
+```
+
+**Timeout behavior by return value:**
+
+| Return Value | Behavior |
+|--------------|----------|
+| `-1` (default) | Use global `jobTimeoutSeconds` from OSGi config |
+| `0` | Disable timeout for this job (runs indefinitely) |
+| `> 0` | Use this specific timeout in seconds |
+
+This allows fine-grained control where quick jobs use the default timeout while long-running jobs (imports, bulk operations) can specify their own limits.
 
 ### JcrJobPersistenceService
 
