@@ -55,6 +55,11 @@ public interface GuardedJob<T> {
      * 
      * <p>This method is called by the {@link JobProcessor} when it's time
      * to process this job according to its ordering token.</p>
+     * 
+     * <p>For synchronous jobs (default), this method should complete the full
+     * job execution before returning. For asynchronous jobs (where {@link #isAsync()}
+     * returns true), this method may return after initiating the async operation,
+     * and the processor will poll {@link #isComplete(Map)} to determine completion.</p>
      *
      * @param parameters the parameters for the job (from HTTP request)
      * @return the result of the job execution
@@ -62,6 +67,50 @@ public interface GuardedJob<T> {
      */
     T execute(Map<String, Object> parameters) throws Exception;
 
+    /**
+     * Indicates whether this job is asynchronous.
+     * 
+     * <p>For synchronous jobs (default), {@link #execute(Map)} is expected to block
+     * until the job completes. For asynchronous jobs, {@code execute()} may return
+     * immediately after initiating the async operation, and the processor will
+     * poll {@link #isComplete(Map)} to determine when the job has finished.</p>
+     *
+     * @return true if this job is asynchronous, false otherwise (default)
+     */
+    default boolean isAsync() {
+        return false;
+    }
+
+    /**
+     * Checks whether an asynchronous job has completed.
+     * 
+     * <p>This method is only called for jobs where {@link #isAsync()} returns true.
+     * The processor will poll this method periodically after {@link #execute(Map)}
+     * returns to determine when the async work has finished.</p>
+     * 
+     * <p>The same parameters passed to {@code execute()} are provided here,
+     * allowing the implementation to look up the status of the initiated operation.</p>
+     *
+     * @param parameters the same parameters that were passed to {@link #execute(Map)}
+     * @return true if the async job has completed, false if still in progress
+     * @throws Exception if checking completion status fails
+     */
+    default boolean isComplete(Map<String, Object> parameters) throws Exception {
+        return true; // Synchronous jobs are always complete after execute()
+    }
+
+    /**
+     * Returns the polling interval in milliseconds for checking async job completion.
+     * 
+     * <p>Override this method to customize how frequently {@link #isComplete(Map)}
+     * is called when waiting for an async job to finish. Only applies when
+     * {@link #isAsync()} returns true.</p>
+     *
+     * @return the polling interval in milliseconds, defaults to 1000ms (1 second)
+     */
+    default long getAsyncPollingIntervalMs() {
+        return 1000;
+    }
 
     /**
      * Returns the timeout in seconds for this job.
@@ -71,6 +120,9 @@ public interface GuardedJob<T> {
      * to use the global timeout configured in {@code OrderedJobProcessor}.</p>
      * 
      * <p>Returning 0 disables timeout for this job (use with caution).</p>
+     * 
+     * <p>For async jobs, this timeout covers the total time from when {@link #execute(Map)}
+     * is called until {@link #isComplete(Map)} returns true.</p>
      *
      * @return the timeout in seconds, 0 to disable timeout, or -1 to use the global default
      */

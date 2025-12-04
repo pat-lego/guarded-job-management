@@ -367,6 +367,96 @@ public class LongRunningImportJob implements GuardedJob<String> {
 
 This allows fine-grained control where quick jobs use the default timeout while long-running jobs (imports, bulk operations) can specify their own limits.
 
+#### Asynchronous Jobs
+
+Some jobs trigger external processes that complete independently (e.g., workflows, external API calls, background tasks). For these cases, `GuardedJob` supports **asynchronous execution** where:
+
+1. `execute()` initiates the async operation and returns immediately
+2. The processor polls `isComplete()` until the job finishes
+3. The job is only removed from JCR after `isComplete()` returns `true`
+
+**Implementing an Async Job:**
+
+```java
+@Component(service = GuardedJob.class)
+public class AsyncWorkflowJob implements GuardedJob<String> {
+    
+    @Reference
+    private WorkflowService workflowService;
+    
+    @Override
+    public String getName() {
+        return "async-workflow";
+    }
+    
+    @Override
+    public String execute(Map<String, Object> parameters) throws Exception {
+        String workflowId = workflowService.startWorkflow((String) parameters.get("model"));
+        // Store the workflow ID in parameters for isComplete() to check
+        parameters.put("_workflowId", workflowId);
+        return workflowId;
+    }
+    
+    @Override
+    public boolean isAsync() {
+        return true;  // Mark this job as asynchronous
+    }
+    
+    @Override
+    public boolean isComplete(Map<String, Object> parameters) throws Exception {
+        String workflowId = (String) parameters.get("_workflowId");
+        return workflowService.getStatus(workflowId).isTerminated();
+    }
+    
+    @Override
+    public long getAsyncPollingIntervalMs() {
+        return 5000;  // Check every 5 seconds
+    }
+    
+    @Override
+    public long getTimeoutSeconds() {
+        return 600;  // 10 minute timeout for workflow completion
+    }
+}
+```
+
+**Async Job Methods:**
+
+| Method | Default | Description |
+|--------|---------|-------------|
+| `isAsync()` | `false` | Return `true` to enable async polling behavior |
+| `isComplete(parameters)` | `true` | Called repeatedly until it returns `true` (only for async jobs) |
+| `getAsyncPollingIntervalMs()` | `1000` | Milliseconds between `isComplete()` checks |
+
+**Important Notes:**
+
+- **Timeout enforcement**: Async jobs **always** have a timeout enforced (falls back to global `jobTimeoutSeconds` if not specified). This prevents runaway polling loops.
+- **JCR cleanup**: Jobs are removed from JCR after timeout OR successful completion, preventing circular re-polling.
+- **Parameter sharing**: The same `parameters` map is passed to both `execute()` and `isComplete()`, allowing you to store tracking IDs or state.
+
+**Async Job Flow:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Async Job Execution                          │
+│                                                                      │
+│  execute()     isComplete()    isComplete()    isComplete()         │
+│     │               │               │               │                │
+│     ▼               ▼               ▼               ▼                │
+│  ┌──────┐       ┌──────┐       ┌──────┐       ┌──────┐             │
+│  │Start │──────▶│false │──────▶│false │──────▶│ true │──▶ Done!   │
+│  │ async│       │      │       │      │       │      │             │
+│  │ work │       │      │       │      │       │      │             │
+│  └──────┘       └──────┘       └──────┘       └──────┘             │
+│                    ▲               ▲                                 │
+│                    │               │                                 │
+│              poll interval   poll interval                          │
+│               (1000ms)        (1000ms)                              │
+│                                                                      │
+│  ◀───────────────── Timeout enforced across entire span ──────────▶│
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### JcrJobPersistenceService
 
 Job persistence is the **core mechanism** for distributed job processing. All jobs are persisted to JCR, ensuring durability across JVM restarts and global ordering across all AEM instances.

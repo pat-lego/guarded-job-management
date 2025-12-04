@@ -323,8 +323,15 @@ public class OrderedJobProcessor implements JobProcessor {
         long jobSpecificTimeout = jobImpl.getTimeoutSeconds();
         long effectiveTimeout = (jobSpecificTimeout >= 0) ? jobSpecificTimeout : jobTimeoutSeconds;
         
+        // For async jobs, always enforce a timeout to prevent circular polling issues
+        if (jobImpl.isAsync() && effectiveTimeout <= 0) {
+            effectiveTimeout = jobTimeoutSeconds > 0 ? jobTimeoutSeconds : 30; // Fallback to 30s if global is also disabled
+            LOG.warn("Async job '{}' has no timeout configured. Using default timeout of {} seconds to prevent runaway polling.",
+                    jobName, effectiveTimeout);
+        }
+        
         if (effectiveTimeout <= 0) {
-            // No timeout, execute directly
+            // No timeout, execute directly (only for sync jobs)
             try {
                 jobImpl.execute(persistedJob.getParameters());
                 LOG.debug("Job completed: {}", persistedJob.getPersistenceId());
@@ -342,21 +349,45 @@ public class OrderedJobProcessor implements JobProcessor {
             return t;
         });
 
+        final long timeoutSeconds = effectiveTimeout;
         Future<?> jobFuture = jobExecutor.submit(() -> {
             try {
+                long startTime = System.currentTimeMillis();
+                long timeoutMs = timeoutSeconds * 1000;
+                
                 jobImpl.execute(persistedJob.getParameters());
+                
+                // For async jobs, poll until complete or timeout
+                if (jobImpl.isAsync()) {
+                    while (!jobImpl.isComplete(persistedJob.getParameters())) {
+                        long elapsed = System.currentTimeMillis() - startTime;
+                        if (elapsed >= timeoutMs) {
+                            throw new RuntimeException(String.format(
+                                "Async job '%s' did not complete within %d seconds", jobName, timeoutSeconds));
+                        }
+                        
+                        long remainingMs = timeoutMs - elapsed;
+                        long sleepMs = Math.min(jobImpl.getAsyncPollingIntervalMs(), remainingMs);
+                        if (sleepMs > 0) {
+                            Thread.sleep(sleepMs);
+                        }
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Job interrupted", e);
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
         });
 
         try {
-            jobFuture.get(effectiveTimeout, TimeUnit.SECONDS);
+            jobFuture.get(timeoutSeconds, TimeUnit.SECONDS);
             LOG.debug("Job completed: {}", persistedJob.getPersistenceId());
         } catch (TimeoutException e) {
             LOG.warn("Job '{}' in topic '{}' cancelled after {} seconds (timeout). " +
                     "This may indicate a stuck job causing queue bottlenecking.",
-                    jobName, topic, effectiveTimeout);
+                    jobName, topic, timeoutSeconds);
             jobFuture.cancel(true);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

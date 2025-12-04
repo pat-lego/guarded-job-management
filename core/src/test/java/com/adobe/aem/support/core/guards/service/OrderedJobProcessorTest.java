@@ -15,6 +15,7 @@ import org.mockito.ArgumentCaptor;
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -404,6 +405,251 @@ class OrderedJobProcessorTest {
         when(persistenceService.loadAll()).thenReturn(jobs);
         
         assertEquals(2, processor.getTotalPendingCount());
+    }
+
+    // === Async Job Tests ===
+
+    @Test
+    void asyncJob_timesOutAndIsRemovedFromJcr() throws Exception {
+        // Create an async job that never completes
+        CountDownLatch executeStarted = new CountDownLatch(1);
+        GuardedJob<String> neverCompletingAsyncJob = new GuardedJob<String>() {
+            @Override
+            public String getName() { return "never-completing-async-job"; }
+            
+            @Override
+            public String execute(Map<String, Object> parameters) {
+                executeStarted.countDown();
+                return "started";
+            }
+            
+            @Override
+            public boolean isAsync() {
+                return true;
+            }
+            
+            @Override
+            public boolean isComplete(Map<String, Object> parameters) {
+                // Never completes
+                return false;
+            }
+            
+            @Override
+            public long getAsyncPollingIntervalMs() {
+                return 50; // Fast polling for test
+            }
+            
+            @Override
+            public long getTimeoutSeconds() {
+                return 1; // 1 second timeout for fast test
+            }
+        };
+        
+        // Register via reflection
+        Field registeredJobsField = OrderedJobProcessor.class.getDeclaredField("registeredJobs");
+        registeredJobsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, GuardedJob<?>> registeredJobs = (Map<String, GuardedJob<?>>) registeredJobsField.get(processor);
+        registeredJobs.put("never-completing-async-job", neverCompletingAsyncJob);
+        
+        // Set up persisted job
+        String token = tokenService.generateToken();
+        PersistedJob persistedJob = new PersistedJob(
+            "/var/guarded-jobs/async-timeout-job",
+            "topic",
+            token,
+            "never-completing-async-job",
+            Map.of(),
+            System.currentTimeMillis()
+        );
+        
+        when(persistenceService.loadAll())
+            .thenReturn(List.of(persistedJob))
+            .thenReturn(List.of()); // Empty after first poll
+        
+        // Manually trigger poll
+        java.lang.reflect.Method pollMethod = OrderedJobProcessor.class.getDeclaredMethod("pollAndProcessJobs");
+        pollMethod.setAccessible(true);
+        pollMethod.invoke(processor);
+        
+        // Wait for execute to start
+        assertTrue(executeStarted.await(2, TimeUnit.SECONDS), "Job execute() should have been called");
+        
+        // Wait for timeout + some buffer (job has 1s timeout)
+        // Job should be removed from JCR after timeout
+        verify(persistenceService, timeout(5000)).remove("/var/guarded-jobs/async-timeout-job");
+    }
+
+    @Test
+    void asyncJob_completesSuccessfullyAndIsRemovedFromJcr() throws Exception {
+        // Create an async job that completes after a few polls
+        CountDownLatch executeStarted = new CountDownLatch(1);
+        CountDownLatch jobCompleted = new CountDownLatch(1);
+        AtomicInteger pollCount = new AtomicInteger(0);
+        
+        GuardedJob<String> completingAsyncJob = new GuardedJob<String>() {
+            @Override
+            public String getName() { return "completing-async-job"; }
+            
+            @Override
+            public String execute(Map<String, Object> parameters) {
+                executeStarted.countDown();
+                return "started";
+            }
+            
+            @Override
+            public boolean isAsync() {
+                return true;
+            }
+            
+            @Override
+            public boolean isComplete(Map<String, Object> parameters) {
+                // Complete after 3 polls
+                if (pollCount.incrementAndGet() >= 3) {
+                    jobCompleted.countDown();
+                    return true;
+                }
+                return false;
+            }
+            
+            @Override
+            public long getAsyncPollingIntervalMs() {
+                return 50; // Fast polling for test
+            }
+            
+            @Override
+            public long getTimeoutSeconds() {
+                return 5; // Enough time to complete
+            }
+        };
+        
+        // Register via reflection
+        Field registeredJobsField = OrderedJobProcessor.class.getDeclaredField("registeredJobs");
+        registeredJobsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, GuardedJob<?>> registeredJobs = (Map<String, GuardedJob<?>>) registeredJobsField.get(processor);
+        registeredJobs.put("completing-async-job", completingAsyncJob);
+        
+        // Set up persisted job
+        String token = tokenService.generateToken();
+        PersistedJob persistedJob = new PersistedJob(
+            "/var/guarded-jobs/async-success-job",
+            "topic",
+            token,
+            "completing-async-job",
+            Map.of(),
+            System.currentTimeMillis()
+        );
+        
+        when(persistenceService.loadAll())
+            .thenReturn(List.of(persistedJob))
+            .thenReturn(List.of()); // Empty after first poll
+        
+        // Manually trigger poll
+        java.lang.reflect.Method pollMethod = OrderedJobProcessor.class.getDeclaredMethod("pollAndProcessJobs");
+        pollMethod.setAccessible(true);
+        pollMethod.invoke(processor);
+        
+        // Wait for execute to start
+        assertTrue(executeStarted.await(2, TimeUnit.SECONDS), "Job execute() should have been called");
+        
+        // Wait for job to complete
+        assertTrue(jobCompleted.await(2, TimeUnit.SECONDS), "Job should have completed");
+        
+        // Job should be removed from JCR after successful completion
+        verify(persistenceService, timeout(5000)).remove("/var/guarded-jobs/async-success-job");
+    }
+
+    @Test
+    void asyncJob_usesGlobalTimeoutWhenJobTimeoutNotSet() throws Exception {
+        // Create an async job that doesn't specify timeout (returns -1)
+        CountDownLatch executeStarted = new CountDownLatch(1);
+        GuardedJob<String> asyncJobNoTimeout = new GuardedJob<String>() {
+            @Override
+            public String getName() { return "async-job-no-timeout"; }
+            
+            @Override
+            public String execute(Map<String, Object> parameters) {
+                executeStarted.countDown();
+                return "started";
+            }
+            
+            @Override
+            public boolean isAsync() {
+                return true;
+            }
+            
+            @Override
+            public boolean isComplete(Map<String, Object> parameters) {
+                return false; // Never completes
+            }
+            
+            @Override
+            public long getAsyncPollingIntervalMs() {
+                return 50;
+            }
+            
+            @Override
+            public long getTimeoutSeconds() {
+                return -1; // Use global default
+            }
+        };
+        
+        // Register via reflection
+        Field registeredJobsField = OrderedJobProcessor.class.getDeclaredField("registeredJobs");
+        registeredJobsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, GuardedJob<?>> registeredJobs = (Map<String, GuardedJob<?>>) registeredJobsField.get(processor);
+        registeredJobs.put("async-job-no-timeout", asyncJobNoTimeout);
+        
+        // Set up persisted job
+        String token = tokenService.generateToken();
+        PersistedJob persistedJob = new PersistedJob(
+            "/var/guarded-jobs/async-global-timeout-job",
+            "topic",
+            token,
+            "async-job-no-timeout",
+            Map.of(),
+            System.currentTimeMillis()
+        );
+        
+        when(persistenceService.loadAll())
+            .thenReturn(List.of(persistedJob))
+            .thenReturn(List.of());
+        
+        // Reconfigure processor with a very short global timeout for this test
+        Class<?> configClass = findConfigClass();
+        java.lang.reflect.Method activateMethod = OrderedJobProcessor.class.getDeclaredMethod("activate", configClass);
+        activateMethod.setAccessible(true);
+        
+        Object configProxy = java.lang.reflect.Proxy.newProxyInstance(
+            OrderedJobProcessor.class.getClassLoader(),
+            new Class<?>[] { configClass },
+            (proxy, method, args) -> {
+                if ("coalesceTimeMs".equals(method.getName())) {
+                    return 10L;
+                }
+                if ("jobTimeoutSeconds".equals(method.getName())) {
+                    return 1L; // Very short global timeout for test
+                }
+                if ("jobPollIntervalMs".equals(method.getName())) {
+                    return 100L;
+                }
+                return null;
+            }
+        );
+        activateMethod.invoke(processor, configProxy);
+        
+        // Manually trigger poll
+        java.lang.reflect.Method pollMethod = OrderedJobProcessor.class.getDeclaredMethod("pollAndProcessJobs");
+        pollMethod.setAccessible(true);
+        pollMethod.invoke(processor);
+        
+        // Wait for execute to start
+        assertTrue(executeStarted.await(2, TimeUnit.SECONDS), "Job execute() should have been called");
+        
+        // Should timeout using global timeout (1s) and be removed from JCR
+        verify(persistenceService, timeout(5000)).remove("/var/guarded-jobs/async-global-timeout-job");
     }
 
     // === Helper Methods ===
