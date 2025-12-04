@@ -372,18 +372,39 @@ Jobs flow through a distributed pipeline that ensures **global ordering** across
 **Storage structure:**
 ```
 /var/guarded-jobs/
-  {sling-id}/                              # Instance that created the job
-    2024/                                  # Year
-      12/                                  # Month
-        04/                                # Day
-          550e8400-e29b-41d4-a716-446655440000/
-            - jcr:mixinTypes: [gjm:GuardedJob]
-            - gjm:topic: "my-topic"
-            - gjm:tokenTimestamp: 1733325600001 (Long, indexed)
-            - gjm:tokenSignature: "kX9mQz..." (String)
-            - gjm:jobName: "echo"
-            - persistedAt: 1733325600000
-            - parameters: (binary JSON blob)
+  └── {sling-id}/                          # Instance that created the job
+      └── 2024/                            # Year
+          └── 12/                          # Month
+              └── 04/                      # Day
+                  └── 550e8400-e29b-41d4-a716-446655440000/  # Job node (UUID)
+```
+
+#### Job Node Properties
+
+Each job node has the following properties:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `jcr:primaryType` | Name | `nt:unstructured` |
+| `jcr:mixinTypes` | Name[] | `[gjm:GuardedJob]` — Custom mixin for indexing |
+| `gjm:topic` | String | **Mandatory.** The topic/queue this job belongs to |
+| `gjm:tokenTimestamp` | Long | **Mandatory. Indexed.** Nanosecond timestamp from token (for ordering) |
+| `gjm:tokenSignature` | String | HMAC-SHA256 signature portion of the token |
+| `gjm:jobName` | String | **Mandatory.** Name of the GuardedJob implementation |
+| `persistedAt` | Long | Unix timestamp when the job was persisted |
+| `parameters` | Binary | Job parameters serialized as JSON blob |
+
+**Example node in CRXDE:**
+```
+/var/guarded-jobs/3ca578c7-99a2-4924-b7c6-1993cfcf3167/2024/12/04/e8349a4f-7bcc-43be-a3f6-2a6441dc15fd
+  jcr:primaryType = "nt:unstructured"
+  jcr:mixinTypes = ["gjm:GuardedJob"]
+  gjm:topic = "asset-processing"
+  gjm:tokenTimestamp = 1733325600001234567
+  gjm:tokenSignature = "kX9mQzR8vN2pL4hY7wF3jK6tB5..."
+  gjm:jobName = "echo"
+  persistedAt = 1733325600000
+  parameters = (binary)
 ```
 
 #### Custom Mixin Node Type
@@ -406,11 +427,56 @@ Jobs use a custom mixin `gjm:GuardedJob` (registered via repoinit) which:
 
 #### Oak Index
 
-A dedicated Lucene index (`gjmGuardedJobIndex`) is deployed to `/oak:index/` for efficient querying:
-- Indexes `gjm:GuardedJob` mixin nodes only
-- Supports ordering by `gjm:tokenTimestamp`
-- Scoped to `/var/guarded-jobs` path
-- Uses async indexing for minimal write impact
+A dedicated Lucene index (`gjmGuardedJobIndex-custom-1`) is deployed to `/oak:index/` for efficient querying.
+
+**Index Configuration:**
+
+| Property | Value | Description |
+|----------|-------|-------------|
+| `type` | `lucene` | Oak Lucene index for full-text and property indexing |
+| `async` | `async` | Asynchronous indexing for minimal write impact |
+| `compatVersion` | `2` | Lucene index compatibility version |
+| `evaluatePathRestrictions` | `true` | Enables `ISDESCENDANTNODE` path queries |
+| `includedPaths` | `[/var/guarded-jobs]` | Only indexes content under this path |
+| `queryPaths` | `[/var/guarded-jobs]` | Queries outside this path won't use this index |
+
+**Indexed Properties:**
+
+| Property | Type | Indexed | Ordered | Purpose |
+|----------|------|---------|---------|---------|
+| `gjm:tokenTimestamp` | Long | ✓ | ✓ | Primary sort key for job ordering |
+| `gjm:topic` | String | ✓ | | Filter jobs by topic |
+| `gjm:jobName` | String | ✓ | | Filter jobs by implementation |
+
+**Index Definition Location:**
+```
+/oak:index/gjmGuardedJobIndex-custom-1
+```
+
+**Index Rules (XML):**
+```xml
+<indexRules jcr:primaryType="nt:unstructured">
+    <gjm:GuardedJob jcr:primaryType="nt:unstructured">
+        <properties jcr:primaryType="nt:unstructured">
+            <tokenTimestamp
+                name="gjm:tokenTimestamp"
+                propertyIndex="{Boolean}true"
+                ordered="{Boolean}true"
+                type="Long"/>
+            <topic
+                name="gjm:topic"
+                propertyIndex="{Boolean}true"
+                type="String"/>
+            <jobName
+                name="gjm:jobName"
+                propertyIndex="{Boolean}true"
+                type="String"/>
+        </properties>
+    </gjm:GuardedJob>
+</indexRules>
+```
+
+> **Note:** The `ordered="{Boolean}true"` on `tokenTimestamp` is critical — it enables efficient `ORDER BY` queries without in-memory sorting.
 
 #### Query-Based Loading
 
@@ -568,8 +634,10 @@ guarded-job-management/
 │       │   ├── com.adobe.aem.support.core.guards.service.impl.OrderedJobProcessor.cfg.json
 │       │   ├── org.apache.sling.serviceusermapping.impl.ServiceUserMapperImpl.amended-guarded-job-management.cfg.json
 │       │   └── org.apache.sling.jcr.repoinit.RepositoryInitializer~guarded-job-management.cfg.json
+├── ui.apps/
+│   └── src/main/content/jcr_root/
 │       └── _oak_index/
-│           └── gjmGuardedJobIndex/         # Oak Lucene index for job queries
+│           └── gjmGuardedJobIndex-custom-1/  # Oak Lucene index for job queries
 ├── scripts/
 │   ├── submit-jobs.mjs                          # Test script
 │   └── package.json
