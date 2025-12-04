@@ -942,7 +942,7 @@ guarded-job-management/
 
 - **Java 11** or higher
 - **Maven 3.6+**
-- **AEM 6.5** or **AEM as a Cloud Service** (for deployment)
+- **AEM as a Cloud Service** (for deployment)
 
 ### Build Commands
 
