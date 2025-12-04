@@ -20,7 +20,7 @@ Instance B receives Job 2 ──▶ Token: 10:00:00.150 ──┼──▶ Topic
 Instance A receives Job 3 ──▶ Token: 10:00:00.200 ──┘         │
                                                               ▼
                                                     Processed: Job 1 → Job 2 → Job 3
-                                                    (sequential, in token order)S
+                                                    (sequential, in token order)
 ```
 
 This system ensures **ordered, sequential execution** within each topic, even when jobs are submitted from different machines.
@@ -116,6 +116,33 @@ Topic: "asset-processing"     Topic: "page-publishing"
        A → B → C                      X → Y → Z
                                       (independently)
 ```
+
+### Dynamic Topic Creation
+
+Topics are created **on-the-fly** from the JSON payload — no pre-registration, no configuration. The `topic` string in your request dynamically creates isolation boundaries:
+
+```json
+// All replication for site A - processed sequentially
+{"topic": "site-a-publishing", "jobName": "replicate", "parameters": {...}}
+
+// All replication for site B - sequential, but parallel to site A
+{"topic": "site-b-publishing", "jobName": "replicate", "parameters": {...}}
+
+// Per-page isolation for maximum parallelism
+{"topic": "publish:/content/site/page-123", "jobName": "replicate", "parameters": {...}}
+```
+
+**Topic Strategy Patterns:**
+
+| Topic Strategy | Example | Behavior |
+|----------------|---------|----------|
+| Single topic | `"publishing"` | All jobs sequential (simple, safe) |
+| Per-site | `"publish-{site}"` | Sequential within site, parallel across sites |
+| Per-path | `"publish:{path}"` | Sequential per resource, maximum parallelism |
+| Per-user | `"user-{userId}"` | Isolate user workloads |
+| Per-batch | `"import-{batchId}"` | Group batch operations |
+
+The caller controls the concurrency model at runtime — no code changes, no restarts. This enables flexible workload partitioning based on your specific ordering requirements.
 
 ### Coalesce Timing
 
